@@ -1,0 +1,3 @@
+Wrote a py file Export.py that converts the details of the scene into a JSON format
+My Camera class both parses the json file and converts from pixel coords to a ray in world coords (check pixel_to_ray())
+My Image class takes a ppm from the Textures folder and writes it to Output folder and is capable of editing the ppm using set and write methods

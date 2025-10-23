@@ -1,0 +1,117 @@
+[
+    {
+        "name": "Camera",
+        "type": "CAMERA",
+        "location": [
+            7.358891487121582,
+            -6.925790786743164,
+            4.958309173583984
+        ],
+        "rotation_euler_radians": [
+            1.1093189716339111,
+            0.0,
+            0.8149281740188599
+        ],
+        "scale": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "material_base_color_rgb": null,
+        "camera_properties": {
+            "lens_type": "PERSP",
+            "focal_length_mm": 50.0,
+            "sensor_fit": "AUTO",
+            "sensor_width_mm": 36.0,
+            "sensor_height_mm": 24.0,
+            "shift_x": 0.0,
+            "shift_y": 0.0,
+            "clip_start": 0.10000000149011612,
+            "clip_end": 100.0
+        }
+    },
+    {
+        "name": "Cube",
+        "type": "MESH",
+        "location": [
+            0.0,
+            0.0,
+            -1.3465454578399658
+        ],
+        "rotation_euler_radians": [
+            0.0,
+            0.0,
+            0.0
+        ],
+        "scale": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "material_base_color_rgb": [
+            0.800000011920929,
+            0.800000011920929,
+            0.800000011920929
+        ]
+    },
+    {
+        "name": "Light",
+        "type": "LIGHT",
+        "location": [
+            4.653069496154785,
+            0.3800235986709595,
+            5.081028938293457
+        ],
+        "rotation_euler_radians": [
+            0.6503279805183411,
+            0.055217113345861435,
+            1.8663908243179321
+        ],
+        "scale": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "material_base_color_rgb": null
+    },
+    {
+        "name": "Mball",
+        "type": "META",
+        "location": [
+            0.0,
+            0.0,
+            0.7156555652618408
+        ],
+        "rotation_euler_radians": [
+            0.0,
+            0.0,
+            0.0
+        ],
+        "scale": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "material_base_color_rgb": null
+    },
+    {
+        "name": "Plane",
+        "type": "MESH",
+        "location": [
+            0.0,
+            0.0,
+            -1.3465454578399658
+        ],
+        "rotation_euler_radians": [
+            0.0,
+            0.0,
+            0.0
+        ],
+        "scale": [
+            5.0,
+            5.0,
+            1.0
+        ],
+        "material_base_color_rgb": null
+    }
+]

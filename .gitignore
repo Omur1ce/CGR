@@ -1,0 +1,27 @@
+# Build and executables
+*.exe
+*.obj
+*.o
+*.out
+
+# IDE and system files
+.vscode/
+*.log
+.DS_Store
+Thumbs.db
+
+# Output images / renders
+Output/
+Textures/
+*.ppm
+
+# Blender caches
+Blend/*.blend1
+Blend/__pycache__/
+
+# Generated files
+ASCII/*.txt
+ASCII/*.json
+
+# OS noise
+desktop.ini
