@@ -40,7 +40,17 @@ struct Mat4 {
         Mat4 r = identity(); r.m[12]=t.x; r.m[13]=t.y; r.m[14]=t.z; return r;
     }
     static Mat4 scale(float s){
-        Mat4 r={0}; r.m[0]=r.m[5]=r.m[10]=s; r.m[15]=1.0f; return r;
+        Mat4 r = identity();
+        r.m[0]=r.m[5]=r.m[10]=s;
+        return r;
+    }
+    // NEW: non-uniform scale
+    static Mat4 scale(const Vec3& s){
+        Mat4 r = identity();
+        r.m[0] = s.x;
+        r.m[5] = s.y;
+        r.m[10]= s.z;
+        return r;
     }
     // ZYX Euler rotation in radians
     static Mat4 rotateXYZ(const Vec3& rot){

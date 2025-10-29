@@ -12,6 +12,8 @@ public:
     Camera() :
         position_x(0), position_y(0), position_z(0),
         forward_x(0), forward_y(0), forward_z(-1),
+        // Default Blender world-up is Z+
+        up_x(0), up_y(0), up_z(1),
         focal_length(35.0),               // default mm
         sensor_width(36.0), sensor_height(24.0),
         film_resolution_x(640), film_resolution_y(480) {}
@@ -59,8 +61,9 @@ public:
         if (fLen < 1e-6) { fx = 0; fy = 0; fz = -1; fLen = 1; }
         fx /= fLen; fy /= fLen; fz /= fLen;
 
-        // temporary up (world up)
-        double upx = 0, upy = 1, upz = 0;
+        // Use exported up_vector if present; default to Blender Z-up (0,0,1)
+        double upx = up_x, upy = up_y, upz = up_z;
+        // If nearly collinear with forward, choose a safe fallback (X+)
         double dotfu = fx*upx + fy*upy + fz*upz;
         if (std::fabs(dotfu) > 0.999) { upx = 1; upy = 0; upz = 0; }
 
@@ -69,6 +72,7 @@ public:
         double ry = fz*upx - fx*upz;
         double rz = fx*upy - fy*upx;
         double rLen = std::sqrt(rx*rx + ry*ry + rz*rz);
+        if (rLen < 1e-12) { rx = 1; ry = 0; rz = 0; rLen = 1; } // ultra-defensive
         rx /= rLen; ry /= rLen; rz /= rLen;
 
         // true up = cross(right, forward)
@@ -81,10 +85,11 @@ public:
         double ndc_y = 1.0 - ((py + 0.5) / (double)film_resolution_y) * 2.0;
 
         // Convert to sensor plane mm
+        // (This matches a symmetric pinhole with physical sensor size.)
         double sx = (sensor_width  * 0.5) * ndc_x;
         double sy = (sensor_height * 0.5) * ndc_y;
 
-        // Direction in camera space
+        // Direction in world space: f * focal + r * sx + up * sy
         double ddx = fx * focal_length + rx * sx + tux * sy;
         double ddy = fy * focal_length + ry * sx + tuy * sy;
         double ddz = fz * focal_length + rz * sx + tuz * sy;
@@ -108,6 +113,10 @@ public:
     double fwd_y() const { return forward_y; }
     double fwd_z() const { return forward_z; }
 
+    double up_vec_x() const { return up_x; }
+    double up_vec_y() const { return up_y; }
+    double up_vec_z() const { return up_z; }
+
     double focal_mm() const { return focal_length; }
     double sensor_w_mm() const { return sensor_width; }
     double sensor_h_mm() const { return sensor_height; }
@@ -116,6 +125,7 @@ public:
         std::cout << "Camera Info:\n";
         std::cout << "  Position: (" << position_x << ", " << position_y << ", " << position_z << ")\n";
         std::cout << "  Forward:  (" << forward_x << ", " << forward_y << ", " << forward_z << ")\n";
+        std::cout << "  Up:       (" << up_x << ", " << up_y << ", " << up_z << ")\n";
         std::cout << "  Focal Length: " << focal_length << "\n";
         std::cout << "  Sensor: " << sensor_width << " x " << sensor_height << "\n";
         std::cout << "  Film Resolution: " << film_resolution_x << " x " << film_resolution_y << "\n";
@@ -124,6 +134,7 @@ public:
 private:
     double position_x, position_y, position_z;
     double forward_x, forward_y, forward_z;
+    double up_x, up_y, up_z;          // NEW: store exported up vector (world-space)
     double focal_length;
     double sensor_width, sensor_height;
     int film_resolution_x, film_resolution_y;
@@ -171,6 +182,10 @@ private:
             else if (line.find("\"gaze_vector\"") != std::string::npos) {
                 auto gaze = parse_array<double>(file, line);
                 if (gaze.size() == 3) { forward_x=gaze[0]; forward_y=gaze[1]; forward_z=gaze[2]; }
+            }
+            else if (line.find("\"up_vector\"") != std::string::npos) {
+                auto up = parse_array<double>(file, line);
+                if (up.size() == 3) { up_x=up[0]; up_y=up[1]; up_z=up[2]; }
             }
             else if (line.find("\"focal_length\"") != std::string::npos) {
                 focal_length = std::stod(trim(line.substr(line.find(':') + 1)));

@@ -3,23 +3,38 @@ import bpy
 import mathutils
 import os
 
+
 def export_cameras(scene):
     cameras = []
     for obj in bpy.data.objects:
         if obj.type == 'CAMERA':
-            # Compute gaze direction (camera looks along -Z in local space)
-            gaze_vector = obj.matrix_world.to_3x3() @ mathutils.Vector((0, 0, -1))
+            # World-space TRS
+            loc = obj.matrix_world.translation
+            R3  = obj.matrix_world.to_3x3()
+
+            # Blender camera local axes:
+            # forward = -Z, up = +Y, right = +X
+            gaze = (R3 @ mathutils.Vector((0, 0, -1))).normalized()
+            up   = (R3 @ mathutils.Vector((0, 1,  0))).normalized()
+
             camera = {
-                'name': obj.name,
-                'location': list(obj.location),
-                'gaze_vector': list(gaze_vector),
-                'focal_length': obj.data.lens,
-                'sensor_width': obj.data.sensor_width,
-                'sensor_height': obj.data.sensor_height,
-                'film_resolution': [
+                "name": obj.name,
+                "location": [loc.x, loc.y, loc.z],
+                "gaze_vector": [gaze.x, gaze.y, gaze.z],
+                "up_vector":   [up.x,   up.y,   up.z],
+                "focal_length": obj.data.lens,           # mm
+                "sensor_width": obj.data.sensor_width,   # mm
+                "sensor_height": obj.data.sensor_height, # mm
+                "film_resolution": [
                     scene.render.resolution_x,
                     scene.render.resolution_y
-                ]
+                ],
+                # optional but helpful for exact matching:
+                "pixel_aspect": [
+                    scene.render.pixel_aspect_x,
+                    scene.render.pixel_aspect_y
+                ],
+                "resolution_percentage": scene.render.resolution_percentage
             }
             cameras.append(camera)
     return cameras
@@ -45,7 +60,8 @@ def export_spheres():
             sphere = {
                 'name': obj.name,
                 'location': list(obj.location),
-                'radius': obj.scale[0]  # assumes uniform scaling
+                # export full x, y, z scaling from Blender
+                'scale': list(obj.scale)
             }
             spheres.append(sphere)
     return spheres
@@ -59,10 +75,12 @@ def export_cubes():
                 'name': obj.name,
                 'translation': list(obj.location),
                 'rotation': list(obj.rotation_euler),  # radians
-                'scale': obj.scale[0]  # assumes uniform scaling
+                # export full x, y, z scaling from Blender
+                'scale': list(obj.scale)
             }
             cubes.append(cube)
     return cubes
+
 
 
 def export_planes():

@@ -1,0 +1,21 @@
+Introduced a new header file bvh.h defining a Bounding Volume Hierarchy (BVH).
+Each node stores an AABB and either:
+-child indices (for internal nodes)
+-a small list of shape pointers (for leaves)
+BVH is built recursively by splitting shapes along the largest axis of their bounding boxes’ centroids.
+Intersection is performed using AABB–ray tests, descending only into potentially intersected branches.
+
+The Raytracer.cpp main loop was updated to:
+Collect raw shape pointers + build the BVH before rendering  + compare results between brute-force and BVH-accelerated intersection modes.
+Benchmarking done using C++ <chrono> timers:
+Loaded 141 shapes.
+BVH build: 0 ms
+Brute force: 6439.19 ms, hits=506838
+BVH:         509.996 ms, hits=506838
+Speedup:     12.626x
+
+Big issue with my previous implementation was non uniform scaling. Added geom.h to deal with weirdly scaled objects.
+
+When dealing with the transforms, we leave all objects in world space; they’re never transformed into camera space. 
+Instead, we transform the rays emittedby the camera so that they correctly originate and travel through the scene from the
+camera’s actual position and orientation.
