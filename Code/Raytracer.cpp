@@ -7,6 +7,7 @@
 #include <memory>
 #include <chrono>
 #include <unordered_map>
+#include <random>   // <-- for AA jitter
 
 #include "geom.h"
 #include "intersect.h"
@@ -60,8 +61,6 @@ struct Material {
 };
 
 // Parse a "material" block inline within an open JSON object.
-// We rely on the outer object loop using a brace depth counter,
-// so we simply sniff for known keys as lines pass by.
 static inline void maybeParseMaterial(std::ifstream& f, const std::string& line, Material& M){
     std::string L = line;
     if (L.find("\"kd\"") != std::string::npos){
@@ -399,36 +398,89 @@ int main(){
     double build_ms = std::chrono::duration<double, std::milli>(tBuild1 - tBuild0).count();
     std::cout << "BVH build: " << build_ms << " ms\n";
 
-    // ---------- Render (Whitted) ----------
+    // ---------- Render (Whitted + SSAA) ----------
     int W = cam.film_width() > 0 ? cam.film_width() : 640;
     int H = cam.film_height() > 0 ? cam.film_height() : 480;
     std::vector<Vec3> fb(W*H);
+
+    // Anti-aliasing settings
+    const int  SPP = 9;          // samples per pixel (1 = off). If SPP is a perfect square, use stratified.
+    std::mt19937 rng(1337);
+    std::uniform_real_distribution<float> U(0.f, 1.f);
 
     auto render_and_time = [&](bool useBVH, int& hitCountOut) -> double {
         hitCountOut = 0;
         auto t0 = std::chrono::high_resolution_clock::now();
 
+        int n = (int)std::round(std::sqrt((float)SPP));
+        bool stratified = (n*n == SPP);
+
         for(int y=0;y<H;++y){
             for(int x=0;x<W;++x){
-                float ox,oy,oz,dx,dy,dz;
-                cam.pixel_to_ray((float)x,(float)y,ox,oy,oz,dx,dy,dz);
-                Ray ray{Vec3(ox,oy,oz), normalize(Vec3(dx,dy,dz))};
+                Vec3 accum(0,0,0);
+                bool pixelAnyHit = false;
 
-                // Count any hit for stats
-                Hit hcount;
-                bool anyHit = useBVH ? bvh.intersect(ray, hcount)
-                                     : ([&]{
-                                            for(const auto& s:shapes){
-                                                Hit h; if(s->intersect(ray,h) && h.t < hcount.t){ hcount=h; return true; }
-                                            }
-                                            return false;
-                                        })();
-                if (anyHit) hitCountOut++;
+                if (SPP <= 1){
+                    // single sample centre
+                    float ox,oy,oz,dx,dy,dz;
+                    cam.pixel_to_ray((float)x,(float)y,ox,oy,oz,dx,dy,dz);
+                    Ray ray{Vec3(ox,oy,oz), normalize(Vec3(dx,dy,dz))};
 
-                // Whitted color
-                Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights, 0)
-                                  : traceRay(ray, shapes, nullptr, matOf, lights, 0);
-                fb[y*W + x] = col;
+                    Hit hcount;
+                    bool anyHit = useBVH ? bvh.intersect(ray, hcount)
+                                         : ([&]{ for(const auto& s:shapes){ Hit h; if(s->intersect(ray,h) && h.t<hcount.t){hcount=h; return true;} } return false; })();
+                    if(anyHit) { ++hitCountOut; pixelAnyHit=true; }
+
+                    Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights, 0)
+                                      : traceRay(ray, shapes, nullptr, matOf, lights, 0);
+                    accum = col;
+                } else if (stratified){
+                    for(int sy=0; sy<n; ++sy){
+                        for(int sx=0; sx<n; ++sx){
+                            float jx = (sx + U(rng)) / float(n);
+                            float jy = (sy + U(rng)) / float(n);
+                            float px = x + jx;
+                            float py = y + jy;
+
+                            float ox,oy,oz,dx,dy,dz;
+                            cam.pixel_to_ray(px, py, ox,oy,oz,dx,dy,dz);
+                            Ray ray{Vec3(ox,oy,oz), normalize(Vec3(dx,dy,dz))};
+
+                            Hit hcount;
+                            bool anyHit = useBVH ? bvh.intersect(ray, hcount)
+                                                 : ([&]{ for(const auto& s:shapes){ Hit h; if(s->intersect(ray,h) && h.t<hcount.t){hcount=h; return true;} } return false; })();
+                            if(anyHit) pixelAnyHit=true;
+
+                            Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights, 0)
+                                              : traceRay(ray, shapes, nullptr, matOf, lights, 0);
+                            accum += col;
+                        }
+                    }
+                    accum = accum / float(SPP);
+                    if(pixelAnyHit) ++hitCountOut;
+                } else {
+                    for(int s=0; s<SPP; ++s){
+                        float px = x + U(rng);
+                        float py = y + U(rng);
+
+                        float ox,oy,oz,dx,dy,dz;
+                        cam.pixel_to_ray(px, py, ox,oy,oz,dx,dy,dz);
+                        Ray ray{Vec3(ox,oy,oz), normalize(Vec3(dx,dy,dz))};
+
+                        Hit hcount;
+                        bool anyHit = useBVH ? bvh.intersect(ray, hcount)
+                                             : ([&]{ for(const auto& sh:shapes){ Hit h; if(sh->intersect(ray,h) && h.t<hcount.t){hcount=h; return true;} } return false; })();
+                        if(anyHit) pixelAnyHit=true;
+
+                        Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights, 0)
+                                          : traceRay(ray, shapes, nullptr, matOf, lights, 0);
+                        accum += col;
+                    }
+                    accum = accum / float(SPP);
+                    if(pixelAnyHit) ++hitCountOut;
+                }
+
+                fb[y*W + x] = accum;
             }
         }
 
@@ -447,6 +499,7 @@ int main(){
     int hits_bvh = 0;
     double ms_bvh = render_and_time(true, hits_bvh);
 
+    std::cout << "SPP: " << SPP << ( ((int)std::round(std::sqrt((float)SPP))) * ((int)std::round(std::sqrt((float)SPP))) == SPP ? " (stratified)" : " (jittered)") << "\n";
     std::cout << "Brute force: " << ms_bruteforce << " ms, hits=" << hits_bruteforce << "\n";
     std::cout << "BVH:         " << ms_bvh        << " ms, hits=" << hits_bvh << "\n";
     if (ms_bvh > 0.0) std::cout << "Speedup:     " << (ms_bruteforce / ms_bvh) << "x\n";

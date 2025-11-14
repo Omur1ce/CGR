@@ -8,12 +8,17 @@ import os
 # ---------------- Material extraction ----------------
 def extract_material(obj):
     """
-    Return a dict with Blinn-Phong-friendly fields derived from Blender materials:
-    kd (diffuse rgb), ks (specular rgb), shininess, reflectivity, transmissive, ior.
-    If no material, returns sensible defaults.
+    Returns a dict for Whitted shading:
+      kd (diffuse), ks (specular), shininess, reflectivity, transmissive, ior,
+      and optionally albedo_texture (image path).
+    Supports Principled, Diffuse+Glossy(+Mix), Glass/Refraction.
     """
-    # defaults
-    mat_out = {
+    import bpy, math
+
+    def clamp01(x): return max(0.0, min(1.0, float(x)))
+    def set_kd(rgb): return [clamp01(rgb[0]), clamp01(rgb[1]), clamp01(rgb[2])]
+
+    out = {
         "kd": [0.8, 0.8, 0.8],
         "ks": [0.2, 0.2, 0.2],
         "shininess": 32.0,
@@ -23,81 +28,178 @@ def extract_material(obj):
     }
 
     mat = obj.active_material or (obj.material_slots[0].material if obj.material_slots else None)
-    if mat is None:
-        return mat_out
+    if not mat:
+        return out
 
-    # Helper: clamp
-    def C(x, lo=0.0, hi=1.0): return max(lo, min(hi, float(x)))
+    def average_image_rgb(img):
+        try:
+            px = img.pixels[:]  # RGBA floats
+            stride = max(1, int((img.size[0] * img.size[1]) / 4096))
+            r = g = b = n = 0
+            for i in range(0, len(px), 4 * stride):
+                r += px[i + 0]; g += px[i + 1]; b += px[i + 2]; n += 1
+            if n > 0:
+                return [r/n, g/n, b/n]
+        except Exception:
+            pass
+        return None
 
-    # Prefer Principled BSDF
-    if getattr(mat, "use_nodes", False) and mat.node_tree:
-        bsdf = None
-        for n in mat.node_tree.nodes:
-            if n.type == 'BSDF_PRINCIPLED':
-                bsdf = n
-                break
-        if bsdf:
-            base_col = list(bsdf.inputs["Base Color"].default_value)[:3]
-            spec      = float(bsdf.inputs["Specular"].default_value)
-            rough     = float(bsdf.inputs["Roughness"].default_value)
-            metal     = float(bsdf.inputs["Metallic"].default_value)
-            transmit  = float(bsdf.inputs.get("Transmission", bsdf.inputs.get("Transmission Weight", None)).default_value
-                              if ("Transmission" in bsdf.inputs or "Transmission Weight" in bsdf.inputs) else 0.0)
-            ior       = float(bsdf.inputs.get("IOR", None).default_value if "IOR" in bsdf.inputs else 1.45)
+    def read_color_socket(sock):
+        # Returns (rgb, texture_path_or_None)
+        if not sock:
+            return None, None
+        if sock.is_linked and sock.links:
+            n = sock.links[0].from_node
+            if n.type == 'RGB':
+                return list(n.outputs[0].default_value[:3]), None
+            if n.type == 'TEX_IMAGE' and getattr(n, "image", None):
+                img = n.image
+                path = bpy.path.abspath(img.filepath)
+                avg = average_image_rgb(img)
+                return (avg if avg else list(n.outputs[0].default_value[:3])), path
+        # unlinked default
+        try:
+            return list(sock.default_value[:3]), None
+        except Exception:
+            return None, None
 
-            # Map to Blinn-Phong-ish:
-            kd = [C(c) for c in base_col]
-            # specular colour: mix white with base for metallic looks
-            ks_scalar = C(spec)
-            ks_col = [(1.0 - metal) * ks_scalar + metal * kd[i] for i in range(3)]
+    def roughness_to_shininess(r):
+        r = clamp01(r)
+        if r < 1e-4:
+            return 512.0
+        # very common mapping: Blinn exponent ~ 2/r^2 - 2 (clamped)
+        return max(2.0, min(512.0, 2.0/(r*r) - 2.0))
 
-            # Approximate Phong shininess from roughness (0..1). Common heuristic:
-            # shininess ≈ 2 / (r^2) - 2, clamp to [2, 512]
-            r = C(rough)
-            shininess = 32.0
-            if r > 1e-4:
-                shininess = max(2.0, min(512.0, 2.0 / (r * r) - 2.0))
-
-            # Reflectivity heuristic: combine metallic + specular
-            reflectivity = C(0.5 * metal + 0.5 * ks_scalar)
-
-            # Transmission and IOR
-            transmissive = C(transmit)
-            ior = max(1.0, min(3.0, ior))
-
-            mat_out.update({
-                "kd": kd,
-                "ks": ks_col,
-                "shininess": float(shininess),
-                "reflectivity": float(reflectivity),
-                "transmissive": float(transmissive),
-                "ior": float(ior)
-            })
-            return mat_out
-
-    # Fallback: non-node material props
-    # Note: in newer Blender, diffuse/specular might be legacy; use best-guess mapping
-    try:
-        # diffuse_color is RGBA; use RGB
-        kd = list(getattr(mat, "diffuse_color", (0.8, 0.8, 0.8, 1.0)))[:3]
+    # Default fallbacks if no nodes:
+    if not getattr(mat, "use_nodes", False) or not mat.node_tree:
+        # Try legacy material props
+        try:
+            dc = getattr(mat, "diffuse_color", (0.8, 0.8, 0.8, 1.0))
+            out["kd"] = set_kd(dc[:3])
+        except Exception:
+            pass
         spec_int = float(getattr(mat, "specular_intensity", 0.2))
         rough = float(getattr(mat, "roughness", 0.5))
-        # simple mappings
-        ks = [spec_int]*3
-        r = C(rough)
-        shininess = max(2.0, min(512.0, 2.0 / (r * r + 1e-6) - 2.0))
-        mat_out.update({
-            "kd": [C(c) for c in kd],
-            "ks": [C(x) for x in ks],
-            "shininess": float(shininess),
-            "reflectivity": float(0.25 * spec_int),
-            "transmissive": 0.0,
-            "ior": 1.5
-        })
-    except Exception:
-        pass
+        out["ks"] = [spec_int]*3
+        out["shininess"] = roughness_to_shininess(rough)
+        out["reflectivity"] = 0.25 * spec_int
+        return out
 
-    return mat_out
+    # Node-based parse
+    nt = mat.node_tree
+    principled = None
+    diffuse = None
+    glossy = None
+    glass = None
+    refr = None
+    mix_nodes = []
+    fresnel_node = None
+    layer_weight = None
+
+    for n in nt.nodes:
+        t = n.type
+        if t == 'BSDF_PRINCIPLED': principled = n
+        elif t == 'BSDF_DIFFUSE': diffuse = n
+        elif t == 'BSDF_GLOSSY': glossy = n
+        elif t == 'BSDF_GLASS': glass = n
+        elif t == 'BSDF_REFRACTION': refr = n
+        elif t == 'MIX_SHADER': mix_nodes.append(n)
+        elif t == 'FRESNEL': fresnel_node = n
+        elif t == 'LAYER_WEIGHT': layer_weight = n
+
+    # 1) PRINCIPLED path (colour + spec + rough + transmission + ior)
+    if principled:
+        base = principled.inputs.get("Base Color")
+        rgb, tex = read_color_socket(base)
+        if rgb: out["kd"] = set_kd(rgb)
+        if tex: out["albedo_texture"] = tex
+
+        spec = principled.inputs.get("Specular")
+        rough = principled.inputs.get("Roughness")
+        metal = principled.inputs.get("Metallic")
+        trans = principled.inputs.get("Transmission")
+        ior_s = principled.inputs.get("IOR")
+
+        s = float(spec.default_value) if spec else 0.2
+        r = float(rough.default_value) if rough else 0.5
+        m = float(metal.default_value) if metal else 0.0
+        tr= float(trans.default_value) if trans else 0.0
+        ior= float(ior_s.default_value) if ior_s else 1.45
+
+        # ks: mix specular with metallic tinting
+        kd = out["kd"]
+        ks_scalar = clamp01(s)
+        ks_col = [(1.0 - m) * ks_scalar + m * kd[i] for i in range(3)]
+        out["ks"] = [clamp01(x) for x in ks_col]
+        out["shininess"] = roughness_to_shininess(r)
+        out["reflectivity"] = clamp01(0.5*m + 0.5*ks_scalar)
+        out["transmissive"] = clamp01(tr)
+        out["ior"] = max(1.0, min(3.0, ior))
+        return out
+
+    # 2) DIFFUSE + GLOSSY (+MIX) pipeline
+    # kd from Diffuse
+    if diffuse:
+        base = diffuse.inputs.get("Color")
+        rgb, tex = read_color_socket(base)
+        if rgb: out["kd"] = set_kd(rgb)
+        if tex: out["albedo_texture"] = tex
+
+    # ks/shininess from Glossy
+    if glossy:
+        gcol = glossy.inputs.get("Color")
+        gro  = glossy.inputs.get("Roughness")
+        rgb, _ = read_color_socket(gcol)
+        if rgb:
+            out["ks"] = set_kd(rgb)
+        r = float(gro.default_value) if gro else 0.2
+        out["shininess"] = roughness_to_shininess(r)
+
+    # reflectivity from Mix Shader factor (if mixing Diffuse & Glossy)
+    # Heuristic: take the first Mix Shader that has two shader inputs and a 'Fac'
+    mix_reflect = None
+    for mix in mix_nodes:
+        fac = mix.inputs.get("Fac")
+        if not fac: continue
+        # If linked to Fresnel/Layer Weight, estimate reflectivity from it
+        if fac.is_linked and fac.links:
+            src = fac.links[0].from_node
+            if src.type == 'FRESNEL':
+                # Normal-incidence reflectance R0 = ((ior-1)/(ior+1))^2
+                ior_val = float(getattr(src.inputs.get("IOR"), "default_value", 1.45))
+                R0 = ((ior_val - 1.0)/(ior_val + 1.0))**2
+                mix_reflect = clamp01(R0)
+                out["ior"] = max(out["ior"], ior_val)
+                break
+            elif src.type == 'LAYER_WEIGHT':
+                # Use Blend as a crude reflectivity
+                blend = float(getattr(src.inputs.get("Blend"), "default_value", 0.5))
+                mix_reflect = clamp01(blend*0.5)
+                break
+        else:
+            # numeric fac (0..1)
+            facv = float(getattr(fac, "default_value", 0.0))
+            mix_reflect = clamp01(facv)
+            break
+    if mix_reflect is not None:
+        out["reflectivity"] = mix_reflect
+    else:
+        # If we have Glossy but no mix info, give a modest reflectivity
+        if glossy:
+            out["reflectivity"] = 0.25
+
+    # 3) Glass / Refraction path (transmissive + ior)
+    if glass or refr:
+        node = glass if glass else refr
+        ro = node.inputs.get("Roughness")
+        io = node.inputs.get("IOR")
+        if io: out["ior"] = float(io.default_value)
+        if ro: out["shininess"] = max(out["shininess"], roughness_to_shininess(float(ro.default_value)))
+        out["transmissive"] = 1.0  # treat as transparent in a Whitted sense
+
+    return out
+
+
 
 # ---------------- Cameras ----------------
 def export_cameras(scene):
