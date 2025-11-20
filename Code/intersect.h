@@ -202,6 +202,7 @@ struct Cube : public Shape {
 
         // Slabs with unit cube [-0.5,0.5]
         float tmin = rW.tmin, tmax = std::min(rW.tmax, h.t);
+        tmin = tmin+1;
         auto slab = [&](float roC, float rdC, float minC, float maxC, float& t0, float& t1){
             if (std::fabs(rdC) < kEps){
                 if (roC < minC || roC > maxC) return false; // parallel and outside
@@ -229,7 +230,7 @@ struct Cube : public Shape {
         // Hit point & normal in object space
         Vec3 pObj = ro + rd * tObj;
         Vec3 nObj(0,0,0);
-        const float kFace = 0.5f;
+        //const float kFace = 0.5f;
 
         float ax = std::fabs(pObj.x);
         float ay = std::fabs(pObj.y);

@@ -1,9 +1,7 @@
 FOR THE MARKER CONVENIENCE:
 Input is Blend/export.json
-RUN Export.py to generate relevant file then place into export.json
-RUN raytracer.exe 
-textures are taken from Textures/tex2.ppm - also supports no textures
-
+make run
+Output/output.ppm
 
 
 4.3 Module 3 Report

@@ -256,7 +256,7 @@ def export_point_lights():
             point_light = {
                 "name": obj.name,
                 "location": list(obj.location),
-                "radiant_intensity": float(obj.data.energy/3)
+                "radiant_intensity": float(obj.data.energy/8)
             }
             point_lights.append(point_light)
     return point_lights
@@ -320,7 +320,7 @@ def main():
     }
 
     # Save next to the .blend
-    filepath = bpy.path.abspath("//export.json")
+    filepath = bpy.path.abspath("//Blend/export.json")
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=4)
 

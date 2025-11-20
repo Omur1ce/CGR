@@ -39,7 +39,7 @@
                 -2.5,
                 2.0
             ],
-            "radiant_intensity": 600.0
+            "radiant_intensity": 75.0
         },
         {
             "name": "TopLight",
@@ -48,7 +48,7 @@
                 0.0,
                 2.0
             ],
-            "radiant_intensity": 800.0
+            "radiant_intensity": 100.0
         }
     ],
     "spheres": [],
