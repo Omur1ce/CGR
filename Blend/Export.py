@@ -50,6 +50,25 @@ def extract_material(obj):
             return None, None
         if sock.is_linked and sock.links:
             n = sock.links[0].from_node
+
+            # --- NEW: handle MixRGB "Multiply" as tint (Color2) ---
+            # e.g. Image Texture -> Color1, Constant Color -> Color2
+            # We want Color2 (the tint) to become kd.
+            if n.type == 'MIX_RGB' and getattr(n, "blend_type", "") == 'MULTIPLY':
+                col2 = n.inputs.get("Color2")
+                if col2:
+                    # If Color2 is linked to an RGB node
+                    if col2.is_linked and col2.links:
+                        n2 = col2.links[0].from_node
+                        if n2.type == 'RGB':
+                            return list(n2.outputs[0].default_value[:3]), None
+                    # Fallback: use Color2's own value
+                    try:
+                        return list(col2.default_value[:3]), None
+                    except Exception:
+                        pass
+                # If we can't read Color2 cleanly, fall back to normal handling below
+
             if n.type == 'RGB':
                 return list(n.outputs[0].default_value[:3]), None
             if n.type == 'TEX_IMAGE' and getattr(n, "image", None):
@@ -156,35 +175,29 @@ def extract_material(obj):
         out["shininess"] = roughness_to_shininess(r)
 
     # reflectivity from Mix Shader factor (if mixing Diffuse & Glossy)
-    # Heuristic: take the first Mix Shader that has two shader inputs and a 'Fac'
     mix_reflect = None
     for mix in mix_nodes:
         fac = mix.inputs.get("Fac")
         if not fac: continue
-        # If linked to Fresnel/Layer Weight, estimate reflectivity from it
         if fac.is_linked and fac.links:
             src = fac.links[0].from_node
             if src.type == 'FRESNEL':
-                # Normal-incidence reflectance R0 = ((ior-1)/(ior+1))^2
                 ior_val = float(getattr(src.inputs.get("IOR"), "default_value", 1.45))
                 R0 = ((ior_val - 1.0)/(ior_val + 1.0))**2
                 mix_reflect = clamp01(R0)
                 out["ior"] = max(out["ior"], ior_val)
                 break
             elif src.type == 'LAYER_WEIGHT':
-                # Use Blend as a crude reflectivity
                 blend = float(getattr(src.inputs.get("Blend"), "default_value", 0.5))
                 mix_reflect = clamp01(blend*0.5)
                 break
         else:
-            # numeric fac (0..1)
             facv = float(getattr(fac, "default_value", 0.0))
             mix_reflect = clamp01(facv)
             break
     if mix_reflect is not None:
         out["reflectivity"] = mix_reflect
     else:
-        # If we have Glossy but no mix info, give a modest reflectivity
         if glossy:
             out["reflectivity"] = 0.25
 
@@ -243,7 +256,7 @@ def export_point_lights():
             point_light = {
                 "name": obj.name,
                 "location": list(obj.location),
-                "radiant_intensity": float(obj.data.energy)
+                "radiant_intensity": float(obj.data.energy/3)
             }
             point_lights.append(point_light)
     return point_lights

@@ -7,12 +7,12 @@
 #include <memory>
 #include <chrono>
 #include <unordered_map>
-#include <random>   // <-- for AA jitter
 
 #include "geom.h"
 #include "intersect.h"
 #include "camera.h"
 #include "bvh.h"
+#include "texture.h"
 
 // ---------------- Small helpers ----------------
 static inline std::string trim(const std::string& s){
@@ -114,12 +114,13 @@ inline float fresnel_schlick(float cosTheta, float F0){
 static const int   kMaxDepth   = 4;
 static const float kShadowBias = 1e-3f;
 
-// Shade a hit with Blinn-Phong and hard shadows
+// Shade a hit with Blinn-Phong and hard shadows + texture lookup
 Vec3 shadeHit(const Hit& hit, const Vec3& viewDir,
               const std::vector<PointLight>& lights,
               const std::unordered_map<const Shape*, Material>& matOf,
               const std::vector<std::unique_ptr<Shape>>& shapes,
-              const BVH* bvh)
+              const BVH* bvh,
+              const Texture* tex)
 {
     auto it = matOf.find(hit.shape);
     Material mat = (it!=matOf.end()) ? it->second : Material{};
@@ -127,6 +128,14 @@ Vec3 shadeHit(const Hit& hit, const Vec3& viewDir,
     Vec3 N = hit.n;
     Vec3 V = viewDir;
     Vec3 color(0,0,0);
+
+    // Base albedo from texture (if available)
+    Vec3 texAlbedo(1,1,1);
+    if (tex) {
+        float u = hit.uvw.x;
+        float v = hit.uvw.y;
+        texAlbedo = tex->sample(u, v);
+    }
 
     for(const auto& Ls : lights){
         Vec3 Ldir = Ls.position - hit.p;
@@ -154,7 +163,9 @@ Vec3 shadeHit(const Hit& hit, const Vec3& viewDir,
 
         // Blinn-Phong terms
         float NdotL = std::max(0.f, dot(N, Ldir));
-        Vec3 diffuse = mat.kd * NdotL;
+
+        // Combine kd with texture albedo
+        Vec3 diffuse = (mat.kd * texAlbedo) * NdotL; // component-wise * then scalar
 
         Vec3 H = normalize(Ldir + V);
         float NdotH = std::max(0.f, dot(N, H));
@@ -173,6 +184,7 @@ Vec3 traceRay(const Ray& r,
               const BVH* bvh,
               const std::unordered_map<const Shape*, Material>& matOf,
               const std::vector<PointLight>& lights,
+              const Texture* tex,
               int depth)
 {
     if (depth > kMaxDepth) return Vec3(0,0,0);
@@ -189,8 +201,8 @@ Vec3 traceRay(const Ray& r,
     const Material& mat = (matOf.count(hit.shape)? matOf.at(hit.shape) : Material{});
     Vec3 V = normalize((r.dir) * -1.0f);
 
-    // Direct lighting
-    Vec3 Lo = shadeHit(hit, V, lights, matOf, shapes, bvh);
+    // Direct lighting (with texture)
+    Vec3 Lo = shadeHit(hit, V, lights, matOf, shapes, bvh, tex);
 
     // Secondary rays
     Vec3 N = hit.n;
@@ -200,7 +212,7 @@ Vec3 traceRay(const Ray& r,
     if (mat.reflectivity > 0.0f){
         Vec3 Rdir = reflect(r.dir, N);
         Ray rRef{ hit.p + N * kShadowBias, normalize(Rdir) };
-        Vec3 Lr = traceRay(rRef, shapes, bvh, matOf, lights, depth+1);
+        Vec3 Lr = traceRay(rRef, shapes, bvh, matOf, lights, tex, depth+1);
         accum += Lr * mat.reflectivity;
     }
 
@@ -222,7 +234,7 @@ Vec3 traceRay(const Ray& r,
             float Fr = fresnel_schlick(std::fabs(cosi), R0);
 
             Ray rRefr{ hit.p - N * kShadowBias, normalize(Tdir) };
-            Vec3 Lt = traceRay(rRefr, shapes, bvh, matOf, lights, depth+1);
+            Vec3 Lt = traceRay(rRefr, shapes, bvh, matOf, lights, tex, depth+1);
 
             // Mix local + transmission (reflection already added above)
             accum = accum * (1.0f - mat.transmissive)
@@ -386,6 +398,12 @@ int main(){
     }
     std::cout << "Loaded " << lights.size() << " point lights.\n";
 
+    // ---------- Load a single texture (no filenames from Blender) ----------
+    Texture tex;
+    if (!tex.loadPPM("../Textures/tex2.ppm")) {
+        std::cerr << "Warning: could not load ../Textures/tex2.ppm, using flat colors only.\n";
+    }
+
     // ---------- BVH ----------
     std::vector<const Shape*> shapePtrs;
     shapePtrs.reserve(shapes.size());
@@ -398,89 +416,55 @@ int main(){
     double build_ms = std::chrono::duration<double, std::milli>(tBuild1 - tBuild0).count();
     std::cout << "BVH build: " << build_ms << " ms\n";
 
-    // ---------- Render (Whitted + SSAA) ----------
+    // ---------- Render (Whitted + AA) ----------
     int W = cam.film_width() > 0 ? cam.film_width() : 640;
     int H = cam.film_height() > 0 ? cam.film_height() : 480;
     std::vector<Vec3> fb(W*H);
 
-    // Anti-aliasing settings
-    const int  SPP = 9;          // samples per pixel (1 = off). If SPP is a perfect square, use stratified.
-    std::mt19937 rng(1337);
-    std::uniform_real_distribution<float> U(0.f, 1.f);
+    const int spp = 4; // 2x2 stratified supersampling
+    const float invSpp = 1.0f / float(spp);
 
     auto render_and_time = [&](bool useBVH, int& hitCountOut) -> double {
         hitCountOut = 0;
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        int n = (int)std::round(std::sqrt((float)SPP));
-        bool stratified = (n*n == SPP);
-
         for(int y=0;y<H;++y){
             for(int x=0;x<W;++x){
                 Vec3 accum(0,0,0);
-                bool pixelAnyHit = false;
 
-                if (SPP <= 1){
-                    // single sample centre
-                    float ox,oy,oz,dx,dy,dz;
-                    cam.pixel_to_ray((float)x,(float)y,ox,oy,oz,dx,dy,dz);
-                    Ray ray{Vec3(ox,oy,oz), normalize(Vec3(dx,dy,dz))};
-
-                    Hit hcount;
-                    bool anyHit = useBVH ? bvh.intersect(ray, hcount)
-                                         : ([&]{ for(const auto& s:shapes){ Hit h; if(s->intersect(ray,h) && h.t<hcount.t){hcount=h; return true;} } return false; })();
-                    if(anyHit) { ++hitCountOut; pixelAnyHit=true; }
-
-                    Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights, 0)
-                                      : traceRay(ray, shapes, nullptr, matOf, lights, 0);
-                    accum = col;
-                } else if (stratified){
-                    for(int sy=0; sy<n; ++sy){
-                        for(int sx=0; sx<n; ++sx){
-                            float jx = (sx + U(rng)) / float(n);
-                            float jy = (sy + U(rng)) / float(n);
-                            float px = x + jx;
-                            float py = y + jy;
-
-                            float ox,oy,oz,dx,dy,dz;
-                            cam.pixel_to_ray(px, py, ox,oy,oz,dx,dy,dz);
-                            Ray ray{Vec3(ox,oy,oz), normalize(Vec3(dx,dy,dz))};
-
-                            Hit hcount;
-                            bool anyHit = useBVH ? bvh.intersect(ray, hcount)
-                                                 : ([&]{ for(const auto& s:shapes){ Hit h; if(s->intersect(ray,h) && h.t<hcount.t){hcount=h; return true;} } return false; })();
-                            if(anyHit) pixelAnyHit=true;
-
-                            Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights, 0)
-                                              : traceRay(ray, shapes, nullptr, matOf, lights, 0);
-                            accum += col;
-                        }
-                    }
-                    accum = accum / float(SPP);
-                    if(pixelAnyHit) ++hitCountOut;
-                } else {
-                    for(int s=0; s<SPP; ++s){
-                        float px = x + U(rng);
-                        float py = y + U(rng);
+                // 2x2 sample grid inside the pixel
+                for(int sy=0; sy<2; ++sy){
+                    for(int sx=0; sx<2; ++sx){
+                        float jx = (sx + 0.5f) / 2.0f;
+                        float jy = (sy + 0.5f) / 2.0f;
+                        float px = x + jx;
+                        float py = y + jy;
 
                         float ox,oy,oz,dx,dy,dz;
-                        cam.pixel_to_ray(px, py, ox,oy,oz,dx,dy,dz);
+                        cam.pixel_to_ray(px,py,ox,oy,oz,dx,dy,dz);
                         Ray ray{Vec3(ox,oy,oz), normalize(Vec3(dx,dy,dz))};
 
+                        // For hit statistics, only test once per sample
                         Hit hcount;
                         bool anyHit = useBVH ? bvh.intersect(ray, hcount)
-                                             : ([&]{ for(const auto& sh:shapes){ Hit h; if(sh->intersect(ray,h) && h.t<hcount.t){hcount=h; return true;} } return false; })();
-                        if(anyHit) pixelAnyHit=true;
+                                             : ([&]{
+                                                    for(const auto& s:shapes){
+                                                        Hit h; if(s->intersect(ray,h) && h.t < hcount.t){ hcount=h; return true; }
+                                                    }
+                                                    return false;
+                                                })();
+                        if (anyHit) hitCountOut++;
 
-                        Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights, 0)
-                                          : traceRay(ray, shapes, nullptr, matOf, lights, 0);
+                        // Whitted color with texture
+                        Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights,
+                                                     tex.valid() ? &tex : nullptr, 0)
+                                          : traceRay(ray, shapes, nullptr, matOf, lights,
+                                                     tex.valid() ? &tex : nullptr, 0);
                         accum += col;
                     }
-                    accum = accum / float(SPP);
-                    if(pixelAnyHit) ++hitCountOut;
                 }
 
-                fb[y*W + x] = accum;
+                fb[y*W + x] = accum * invSpp;
             }
         }
 
@@ -488,21 +472,20 @@ int main(){
         return std::chrono::duration<double,std::milli>(t1 - t0).count();
     };
 
-    // Warm-up (optional)
-    int tmpHits = 0; render_and_time(true, tmpHits);
+    // // Warm-up (optional)
+    // int tmpHits = 0; render_and_time(true, tmpHits);
 
-    // Measure brute-force
-    int hits_bruteforce = 0;
-    double ms_bruteforce = render_and_time(false, hits_bruteforce);
+    // // Measure brute-force
+    // int hits_bruteforce = 0;
+    // double ms_bruteforce = render_and_time(false, hits_bruteforce);
 
     // Measure BVH
     int hits_bvh = 0;
     double ms_bvh = render_and_time(true, hits_bvh);
 
-    std::cout << "SPP: " << SPP << ( ((int)std::round(std::sqrt((float)SPP))) * ((int)std::round(std::sqrt((float)SPP))) == SPP ? " (stratified)" : " (jittered)") << "\n";
-    std::cout << "Brute force: " << ms_bruteforce << " ms, hits=" << hits_bruteforce << "\n";
+    //std::cout << "Brute force: " << ms_bruteforce << " ms, hits=" << hits_bruteforce << "\n";
     std::cout << "BVH:         " << ms_bvh        << " ms, hits=" << hits_bvh << "\n";
-    if (ms_bvh > 0.0) std::cout << "Speedup:     " << (ms_bruteforce / ms_bvh) << "x\n";
+    //if (ms_bvh > 0.0) std::cout << "Speedup:     " << (ms_bruteforce / ms_bvh) << "x\n";
 
     // ---------- Write output ----------
     std::ofstream out("../Output/output.ppm");

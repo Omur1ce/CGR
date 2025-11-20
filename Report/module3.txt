@@ -1,0 +1,65 @@
+FOR THE MARKER CONVENIENCE:
+Input is Blend/export.json
+RUN Export.py to generate relevant file then place into export.json
+RUN raytracer.exe 
+textures are taken from Textures/tex2.ppm - also supports no textures
+
+
+
+4.3 Module 3 Report
+Whitted-Style Ray Tracing
+
+In this module I extended the ray tracer developed in Modules 1 and 2 into a complete Whitted-style renderer.
+For every pixel in the output image, the program now performs the following:
+
+Primary Ray Generation
+Using the camera parameters exported from Blender, a ray is constructed for each pixel by mapping pixel coordinates onto the physical camera sensor
+(focal length, sensor width/height, resolution).
+The camera coordinate frame (forward, right, up) is built from Blender's world‐space matrices to ensure the rendered perspective matches Blender.
+
+Ray–Shape Intersection
+Each ray is tested against all shapes using either:
+brute-force linear intersection testing, or
+an acceleration structure (BVH) built in Module 2.
+The BVH is used for the final rendering.
+
+(u,v) texture coordinates (added in this module)
+
+Blinn–Phong Shading
+Direct lighting is computed using the Blinn-Phong illumination model.
+Materials exported from Blender (Diffuse, Glossy, Principled, Mix, etc.) are converted to physically-plausible Whitted material parameters:
+kd diffuse colour
+ks specular colour
+shininess exponent
+reflectivity
+transmissive
+ior (index of refraction)
+Hard shadows are computed by casting a shadow ray from the hit point toward each point light.
+Recursive Reflections & Refractions
+For reflective or transparent materials, secondary rays are generated:
+
+These contributions are added to the final colour, weighted by material reflectivity or transmissivity.
+Recursion depth is limited to 4.
+
+Perspective Matching Blender
+Because all camera parameters (position, gaze, up, focal length, sensor size) are taken directly from Blender and the rays are generated in physical camera units,
+the output projection aligns convincingly with the same Blender scene.
+While colours differ (Blinn-Phong vs. Blender’s Principled BSDF), geometry, perspective, and relative shape placement match exactly.
+
+Anti-Aliasing
+
+To reduce jagged edges, supersampling was added:
+Each pixel is sampled multiple times (e.g., 4 samples/pixel)
+Sample positions are jittered randomly within the pixel area
+For each sub-sample, a new camera ray is traced
+Final pixel colour = average of all samples
+This produces smoother edges, cleaner reflections
+
+Textures
+To support texturing, several components were modified:
+Shape Parameterisation
+Cubes use face‐based planar UV mapping
+Spheres/Ellipsoids use spherical UV mapping
+UV coordinates (u, v) are returned as part of the Hit structure
+
+

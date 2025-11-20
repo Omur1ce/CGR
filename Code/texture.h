@@ -1,110 +1,135 @@
-// texture.h
 #pragma once
-#include <vector>
 #include <string>
+#include <vector>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <cctype>
-#include <algorithm>
+#include <cmath>
 #include "geom.h"
 
-// Minimal PPM (P3/P6) loader and bilinear sampler (no external libs).
-struct Texture {
-    int w = 0, h = 0;                 // width, height
-    std::vector<unsigned char> rgb;   // size = w*h*3 (RGB 8-bit)
+// Simple PPM texture loader (P3/P6), stored as 8-bit RGB
+class Texture {
+public:
+    Texture() : width(0), height(0) {}
 
-    static inline void skipSpacesAndComments(std::istream& in){
-        for(;;){
-            int c = in.peek();
-            if (c == '#'){ std::string dummy; std::getline(in, dummy); continue; }
-            if (std::isspace(c)) { in.get(); continue; }
-            break;
-        }
+    explicit Texture(const std::string& filename) {
+        loadPPM(filename);
     }
 
-    bool loadPPM(const std::string& path){
-        w = h = 0; rgb.clear();
+    bool loadPPM(const std::string& filename) {
+        width = height = 0;
+        data.clear();
 
-        std::ifstream f(path, std::ios::binary);
-        if(!f.is_open()) return false;
+        std::ifstream f(filename, std::ios::binary);
+        if (!f.is_open()) {
+            std::cerr << "Texture: cannot open " << filename << "\n";
+            return false;
+        }
 
         std::string magic;
         f >> magic;
-        if(magic != "P6" && magic != "P3") return false;
+        if (magic != "P3" && magic != "P6") {
+            std::cerr << "Texture: only P3/P6 PPM supported\n";
+            return false;
+        }
 
-        skipSpacesAndComments(f);
-        f >> w; skipSpacesAndComments(f);
-        f >> h; skipSpacesAndComments(f);
+        auto skipComments = [&]() {
+            int c;
+            while ((c = f.peek()) == '#') {
+                std::string dummy;
+                std::getline(f, dummy);
+            }
+        };
+
+        skipComments();
+        f >> width >> height;
+        skipComments();
         int maxv = 255;
         f >> maxv;
-        if(maxv <= 0) return false;
+        f.get(); // consume one whitespace after maxv
 
-        // consume 1 whitespace/newline after header
-        f.get();
+        if (width <= 0 || height <= 0 || maxv <= 0) {
+            std::cerr << "Texture: invalid header\n";
+            return false;
+        }
 
-        rgb.resize(w*h*3);
+        data.resize(width * height * 3);
 
-        if(magic == "P6"){
-            // raw binary RGB
-            std::vector<unsigned char> buf(w*h*3);
+        auto mapVal = [&](int v) -> unsigned char {
+            int mapped = (v * 255) / maxv;
+            if (mapped < 0)   mapped = 0;
+            if (mapped > 255) mapped = 255;
+            return static_cast<unsigned char>(mapped);
+        };
+
+        if (magic == "P6") {
+            std::vector<unsigned char> buf(width * height * 3);
             f.read(reinterpret_cast<char*>(buf.data()), buf.size());
-            if(!f) return false;
+            if (!f) {
+                std::cerr << "Texture: binary PPM truncated\n";
+                width = height = 0;
+                data.clear();
+                return false;
+            }
 
-            if(maxv == 255){
-                rgb = std::move(buf);
-            }else{
-                // scale to 8-bit
-                for(size_t i=0;i<buf.size();++i){
-                    rgb[i] = static_cast<unsigned char>( (int(buf[i])*255) / maxv );
+            if (maxv == 255) {
+                data = std::move(buf);
+            } else {
+                for (size_t i = 0; i < buf.size(); ++i) {
+                    int v = buf[i];
+                    data[i] = mapVal(v);
                 }
             }
-        }else{
-            // P3 ASCII
-            for(int i=0;i<w*h;++i){
-                int r,g,b; 
-                if(!(f >> r >> g >> b)) return false;
-                rgb[i*3+0] = static_cast<unsigned char>( std::clamp((r*255)/maxv, 0, 255) );
-                rgb[i*3+1] = static_cast<unsigned char>( std::clamp((g*255)/maxv, 0, 255) );
-                rgb[i*3+2] = static_cast<unsigned char>( std::clamp((b*255)/maxv, 0, 255) );
+        } else { // P3 ASCII
+            for (int i = 0; i < width * height; ++i) {
+                int r, g, b;
+                if (!(f >> r >> g >> b)) {
+                    std::cerr << "Texture: ASCII PPM truncated\n";
+                    width = height = 0;
+                    data.clear();
+                    return false;
+                }
+                data[i * 3 + 0] = mapVal(r);
+                data[i * 3 + 1] = mapVal(g);
+                data[i * 3 + 2] = mapVal(b);
             }
         }
+
+        std::cout << "Loaded texture " << filename
+                  << " (" << width << "x" << height << ")\n";
         return true;
     }
 
-    // Bilinear sample with optional wrap and optional V-flip (images are commonly top-left origin)
-    Vec3 sample(float u, float v, bool wrap=true, bool flipV=true) const {
-        if(w<=0 || h<=0) return Vec3(1,1,1);
-
-        if(wrap){
-            u = u - std::floor(u);
-            v = v - std::floor(v);
-        }else{
-            u = std::max(0.f, std::min(1.f, u));
-            v = std::max(0.f, std::min(1.f, v));
-        }
-
-        if(flipV) v = 1.0f - v;
-
-        float x = u * (w - 1);
-        float y = v * (h - 1);
-
-        int x0 = (int)std::floor(x);
-        int y0 = (int)std::floor(y);
-        int x1 = std::min(x0+1, w-1);
-        int y1 = std::min(y0+1, h-1);
-
-        float tx = x - x0;
-        float ty = y - y0;
-
-        auto at = [&](int X,int Y){
-            int idx = (Y*w + X)*3;
-            return Vec3(rgb[idx]/255.f, rgb[idx+1]/255.f, rgb[idx+2]/255.f);
-        };
-
-        Vec3 c00 = at(x0,y0), c10 = at(x1,y0);
-        Vec3 c01 = at(x0,y1), c11 = at(x1,y1);
-        Vec3 c0 = c00*(1-tx) + c10*tx;
-        Vec3 c1 = c01*(1-tx) + c11*tx;
-        return c0*(1-ty) + c1*ty;
+    bool valid() const {
+        return width > 0 && height > 0 &&
+               data.size() == static_cast<size_t>(width * height * 3);
     }
+
+    // Sample with (u,v) ∈ ℝ; we wrap to [0,1) and nearest-neighbour sample.
+    Vec3 sample(float u, float v) const {
+        if (!valid()) return Vec3(1, 1, 1);
+
+        // wrap u,v to [0,1)
+        u -= std::floor(u);
+        v -= std::floor(v);
+
+        int x = static_cast<int>(u * (width  - 1) + 0.5f);
+        int y = static_cast<int>((1.0f - v) * (height - 1) + 0.5f); // flip v
+
+        if (x < 0) x = 0;
+        if (x >= width) x = width - 1;
+        if (y < 0) y = 0;
+        if (y >= height) y = height - 1;
+
+        int idx = (y * width + x) * 3;
+        float r = data[idx + 0] / 255.0f;
+        float g = data[idx + 1] / 255.0f;
+        float b = data[idx + 2] / 255.0f;
+        return Vec3(r, g, b);
+    }
+
+private:
+    int width, height;
+    std::vector<unsigned char> data;
 };
