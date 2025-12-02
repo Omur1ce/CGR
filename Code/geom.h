@@ -31,6 +31,8 @@ struct Ray {
     Vec3 dir; // should be normalized
     float tmin = 1e-4f; // avoid self-intersections
     float tmax = kInf;
+
+    float time = 0.0f;
 };
 
 struct Mat4 {

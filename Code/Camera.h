@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "geom.h"   // NEW: for Vec3
+
 class Camera {
 public:
     Camera() :
@@ -85,7 +87,6 @@ public:
         double ndc_y = 1.0 - ((py + 0.5) / (double)film_resolution_y) * 2.0;
 
         // Convert to sensor plane mm
-        // (This matches a symmetric pinhole with physical sensor size.)
         double sx = (sensor_width  * 0.5) * ndc_x;
         double sy = (sensor_height * 0.5) * ndc_y;
 
@@ -97,8 +98,42 @@ public:
         ddx/=dLen; ddy/=dLen; ddz/=dLen;
 
         // Output
-        ox = position_x; oy = position_y; oz = position_z;
-        dx = ddx; dy = ddy; dz = ddz;
+        ox = (float)position_x; oy = (float)position_y; oz = (float)position_z;
+        dx = (float)ddx;        dy = (float)ddy;        dz = (float)ddz;
+    }
+
+    // ---------- NEW: expose eye + basis for depth of field ----------
+    void get_eye_and_basis(Vec3 &eye, Vec3 &right, Vec3 &up, Vec3 &forward) const {
+        // Same normalization logic as in pixel_to_ray to keep everything consistent
+
+        // Normalize forward
+        double fx = forward_x, fy = forward_y, fz = forward_z;
+        double fLen = std::sqrt(fx*fx + fy*fy + fz*fz);
+        if (fLen < 1e-6) { fx = 0; fy = 0; fz = -1; fLen = 1; }
+        fx /= fLen; fy /= fLen; fz /= fLen;
+
+        // Use exported up_vector; fall back if nearly parallel
+        double upx = up_x, upy = up_y, upz = up_z;
+        double dotfu = fx*upx + fy*upy + fz*upz;
+        if (std::fabs(dotfu) > 0.999) { upx = 1; upy = 0; upz = 0; }
+
+        // right = normalize(cross(forward, up))
+        double rx = fy*upz - fz*upy;
+        double ry = fz*upx - fx*upz;
+        double rz = fx*upy - fy*upx;
+        double rLen = std::sqrt(rx*rx + ry*ry + rz*rz);
+        if (rLen < 1e-12) { rx = 1; ry = 0; rz = 0; rLen = 1; }
+        rx /= rLen; ry /= rLen; rz /= rLen;
+
+        // true up = cross(right, forward)
+        double tux = ry*fz - rz*fy;
+        double tuy = rz*fx - rx*fz;
+        double tuz = rx*fy - ry*fx;
+
+        eye     = Vec3((float)position_x, (float)position_y, (float)position_z);
+        right   = Vec3((float)rx, (float)ry, (float)rz);
+        up      = Vec3((float)tux, (float)tuy, (float)tuz);
+        forward = Vec3((float)fx, (float)fy, (float)fz);
     }
 
     // ---------- Getters ----------
@@ -134,7 +169,7 @@ public:
 private:
     double position_x, position_y, position_z;
     double forward_x, forward_y, forward_z;
-    double up_x, up_y, up_z;          // NEW: store exported up vector (world-space)
+    double up_x, up_y, up_z;          // exported up vector (world-space)
     double focal_length;
     double sensor_width, sensor_height;
     int film_resolution_x, film_resolution_y;
@@ -204,3 +239,4 @@ private:
         }
     }
 };
+ 

@@ -21,8 +21,9 @@ struct Shape {
 // ===================== Sphere / Ellipsoid =====================
 // Supports both uniform spheres and non-uniform ellipsoids via per-axis scale.
 struct Sphere : public Shape {
-    Vec3 center;  // world-space center
-    Vec3 scale;   // per-axis scale; uniform sphere if x=y=z
+    Vec3 center;        // world-space center at time t = 0
+    Vec3 scale;         // per-axis scale; uniform sphere if x=y=z
+    Vec3 velocity = Vec3(0,0,0);  // motion per unit shutter time t ∈ [0,1]
 
     // Uniform sphere: radius r
     Sphere(const Vec3& c, float r)
@@ -33,6 +34,9 @@ struct Sphere : public Shape {
         : center(c), scale(s) {}
 
     bool intersect(const Ray& rW, Hit& h) const override {
+        // Effective center at this ray's time (motion blur)
+        Vec3 center_t = center + velocity * rW.time;
+
         // Avoid division by zero in degenerate scales
         Vec3 invS(
             (std::fabs(scale.x) > kEps) ? 1.0f/scale.x : 0.0f,
@@ -41,7 +45,8 @@ struct Sphere : public Shape {
         );
 
         // Transform ray into "unit-sphere space" where ellipsoid is x^2+y^2+z^2 = 1
-        Vec3 ocW = rW.origin - center;
+        Vec3 ocW = rW.origin - center_t;
+
         Vec3 ro( ocW.x * invS.x, ocW.y * invS.y, ocW.z * invS.z );
         Vec3 rd( rW.dir.x * invS.x, rW.dir.y * invS.y, rW.dir.z * invS.z );
 
@@ -61,8 +66,8 @@ struct Sphere : public Shape {
             Vec3 pW = rW.origin + rW.dir * t;
 
             // Normal = gradient of ellipsoid at p:
-            // F(x,y,z) = (x-cx)^2/sx^2 + ... - 1
-            Vec3 d = pW - center;
+            // F(x,y,z) = (x-cx)^2/sx^2 + ... - 1, using center_t
+            Vec3 d = pW - center_t;
             Vec3 n(
                 (std::fabs(scale.x) > kEps) ? d.x / (scale.x*scale.x) : 0.0f,
                 (std::fabs(scale.y) > kEps) ? d.y / (scale.y*scale.y) : 0.0f,
@@ -71,7 +76,6 @@ struct Sphere : public Shape {
             n = normalize(n);
 
             // Spherical UVs using unit-sphere direction
-            // Use the normalized point in "unit sphere" space.
             Vec3 pLocal(
                 d.x * invS.x,
                 d.y * invS.y,
@@ -98,11 +102,33 @@ struct Sphere : public Shape {
     }
 
     AABB bounds() const override {
-        // Simple axis-aligned bounds ignoring any rotation (spheres have none here)
         Vec3 ext(std::fabs(scale.x), std::fabs(scale.y), std::fabs(scale.z));
-        return AABB(center - ext, center + ext);
+        Vec3 eps(1e-3f, 1e-3f, 1e-3f);   // small safety pad
+
+        // If not moving, just a static sphere/ellipsoid bound
+        if (length(velocity) < 1e-6f) {
+            return AABB(center - ext - eps, center + ext + eps);
+        }
+
+        // Otherwise, bound the whole swept volume over t ∈ [0,1]
+        Vec3 c0 = center;
+        Vec3 c1 = center + velocity;   // position at t=1
+
+        Vec3 minC(
+            std::min(c0.x, c1.x),
+            std::min(c0.y, c1.y),
+            std::min(c0.z, c1.z)
+        );
+        Vec3 maxC(
+            std::max(c0.x, c1.x),
+            std::max(c0.y, c1.y),
+            std::max(c0.z, c1.z)
+        );
+
+        return AABB(minC - ext - eps, maxC + ext + eps);
     }
 };
+
 
 // ===================== PlaneQuad (finite) =====================
 // Defined by 4 corners (world) in CCW order; normal from (p1-p0)x(p3-p0)
@@ -170,8 +196,6 @@ struct PlaneQuad : public Shape {
 };
 
 // ===================== Cube (oriented box) =====================
-// Unit cube in object space [-0.5,0.5]^3; world transform via M.
-// Blender export: translation (tx,ty,tz), rotation Euler (rx,ry,rz), per-axis scale.
 struct Cube : public Shape {
     Mat4 M;          // object->world
     Mat4 invM;       // world->object
@@ -200,43 +224,49 @@ struct Cube : public Shape {
         Vec3 ro = invM.transformPoint(rW.origin);
         Vec3 rd = invM.transformVector(rW.dir);
 
-        // Slabs with unit cube [-0.5,0.5]
-        float tmin = rW.tmin, tmax = std::min(rW.tmax, h.t);
-        tmin = tmin+1;
-        auto slab = [&](float roC, float rdC, float minC, float maxC, float& t0, float& t1){
-            if (std::fabs(rdC) < kEps){
-                if (roC < minC || roC > maxC) return false; // parallel and outside
-                t0 = -kInf; t1 = kInf; return true;
-            }
-            float inv = 1.0f/rdC;
-            float tA = (minC - roC)*inv;
-            float tB = (maxC - roC)*inv;
-            if (tA > tB) std::swap(tA, tB);
-            t0 = tA; t1 = tB; return true;
-        };
-        float tx0,tx1, ty0,ty1, tz0,tz1;
-        if (!slab(ro.x, rd.x, -0.5f, 0.5f, tx0,tx1)) return false;
-        if (!slab(ro.y, rd.y, -0.5f, 0.5f, ty0,ty1)) return false;
-        if (!slab(ro.z, rd.z, -0.5f, 0.5f, tz0,tz1)) return false;
+        // Slabs with canonical cube [-1,1]^3 (matches Blender's cube)
+        float tmax = std::min(rW.tmax, h.t);
 
-        float t0 = std::max({tx0,ty0,tz0});
-        float t1 = std::min({tx1,ty1,tz1});
+        auto slab = [&](float roC, float rdC, float minC, float maxC,
+                        float& t0, float& t1) -> bool
+        {
+            if (std::fabs(rdC) < kEps) {
+                // Ray parallel to these planes: must be inside slab
+                if (roC < minC || roC > maxC) return false;
+                t0 = -kInf; t1 = kInf;
+                return true;
+            }
+            float inv = 1.0f / rdC;
+            float tA  = (minC - roC) * inv;
+            float tB  = (maxC - roC) * inv;
+            if (tA > tB) std::swap(tA, tB);
+            t0 = tA; t1 = tB;
+            return true;
+        };
+
+        float tx0, tx1, ty0, ty1, tz0, tz1;
+        if (!slab(ro.x, rd.x, -1.0f, 1.0f, tx0, tx1)) return false;
+        if (!slab(ro.y, rd.y, -1.0f, 1.0f, ty0, ty1)) return false;
+        if (!slab(ro.z, rd.z, -1.0f, 1.0f, tz0, tz1)) return false;
+
+        float t0 = std::max({tx0, ty0, tz0});
+        float t1 = std::min({tx1, ty1, tz1});
         if (t1 < t0) return false;
 
-        // choose entry
-        float tObj = (t0 > rW.tmin) ? t0 : t1; // handle if origin starts inside
-        if (tObj <= rW.tmin || tObj >= tmax) return false;
+        // Choose entry distance in *object* space:
+        float tObj = t0;
+        if (tObj < 0.0f) tObj = t1;   // if starting inside
+        if (tObj <= 0.0f) return false;
 
         // Hit point & normal in object space
         Vec3 pObj = ro + rd * tObj;
-        Vec3 nObj(0,0,0);
-        //const float kFace = 0.5f;
 
+        // Decide which face we hit from the largest |coordinate|
+        Vec3 nObj(0,0,0);
         float ax = std::fabs(pObj.x);
         float ay = std::fabs(pObj.y);
         float az = std::fabs(pObj.z);
 
-        // Determine which face we hit (largest axis)
         if (ax >= ay && ax >= az) {
             nObj = (pObj.x > 0.0f) ? Vec3(+1,0,0) : Vec3(-1,0,0);
         } else if (ay >= ax && ay >= az) {
@@ -245,50 +275,49 @@ struct Cube : public Shape {
             nObj = (pObj.z > 0.0f) ? Vec3(0,0,+1) : Vec3(0,0,-1);
         }
 
-        // Compute UVs per face in object space
+        // UVs per face in object space, for [-1,1] mapped to [0,1]
         float u = 0.0f, v = 0.0f;
-        // X faces: use (z,y)
-        if (std::fabs(nObj.x) > 0.5f){
-            u = (pObj.z + 0.5f);
-            v = (pObj.y + 0.5f);
+        if (std::fabs(nObj.x) > 0.5f) {
+            // X faces: use (z,y)
+            u = pObj.z * 0.5f + 0.5f;
+            v = pObj.y * 0.5f + 0.5f;
+        } else if (std::fabs(nObj.y) > 0.5f) {
+            // Y faces: use (x,z)
+            u = pObj.x * 0.5f + 0.5f;
+            v = pObj.z * 0.5f + 0.5f;
+        } else {
+            // Z faces: use (x,y)
+            u = pObj.x * 0.5f + 0.5f;
+            v = pObj.y * 0.5f + 0.5f;
         }
-        // Y faces: use (x,z)
-        else if (std::fabs(nObj.y) > 0.5f){
-            u = (pObj.x + 0.5f);
-            v = (pObj.z + 0.5f);
-        }
-        // Z faces: use (x,y)
-        else {
-            u = (pObj.x + 0.5f);
-            v = (pObj.y + 0.5f);
-        }
-        // Clamp to [0,1]
         u = std::max(0.0f, std::min(1.0f, u));
         v = std::max(0.0f, std::min(1.0f, v));
 
-        // Back to world
+        // Back to world space
         Vec3 pW = M.transformPoint(pObj);
-        // Convert t from object to world: solve rW.origin + rW.dir * tW = pW
-        float tW = (std::fabs(rW.dir.x) > kEps) ? (pW.x - rW.origin.x)/rW.dir.x :
-                    (std::fabs(rW.dir.y) > kEps) ? (pW.y - rW.origin.y)/rW.dir.y :
-                    (pW.z - rW.origin.z)/rW.dir.z;
+
+        // Convert to world-space t: solve rW.origin + rW.dir * tW = pW
+        float tW;
+        if      (std::fabs(rW.dir.x) > kEps) tW = (pW.x - rW.origin.x) / rW.dir.x;
+        else if (std::fabs(rW.dir.y) > kEps) tW = (pW.y - rW.origin.y) / rW.dir.y;
+        else                                 tW = (pW.z - rW.origin.z) / rW.dir.z;
 
         if (tW <= rW.tmin || tW >= tmax) return false;
 
         Vec3 nW = normalize(invT.transformVector(nObj));
-        // Flip to oppose ray if needed
         if (dot(nW, rW.dir) > 0.0f) nW = nW * -1.0f;
 
-        h.t   = tW;
-        h.p   = pW;
-        h.n   = nW;
-        h.uvw = Vec3(u, v, 0.0f);
-        h.shape = this;
+        h.t    = tW;
+        h.p    = pW;
+        h.n    = nW;
+        h.uvw  = Vec3(u, v, 0.0f);
+        h.shape= this;
         return true;
     }
 
     AABB bounds() const override {
-        const float k = 0.5f;
+        // Bounds of canonical cube [-1,1]^3 mapped through M
+        const float k = 1.0f;
         Vec3 corners[8] = {
             {-k,-k,-k},{+k,-k,-k},{-k,+k,-k},{+k,+k,-k},
             {-k,-k,+k},{+k,-k,+k},{-k,+k,+k},{+k,+k,+k}

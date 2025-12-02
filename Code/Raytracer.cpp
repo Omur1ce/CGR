@@ -7,6 +7,7 @@
 #include <memory>
 #include <chrono>
 #include <unordered_map>
+#include <random>
 
 #include "geom.h"
 #include "intersect.h"
@@ -14,12 +15,16 @@
 #include "bvh.h"
 #include "texture.h"
 
+bool g_enable_textures = true;
+static const float PI = 3.14159265358979323846f;
+
 // ---------------- Small helpers ----------------
 static inline std::string trim(const std::string& s){
     size_t a=s.find_first_not_of(" \t\r\n");
     size_t b=s.find_last_not_of(" \t\r\n");
     return (a==std::string::npos)? "" : s.substr(a,b-a+1);
 }
+
 template<typename T=float>
 std::vector<T> parseArray1D(std::ifstream& f, std::string line){
     std::vector<T> out;
@@ -41,14 +46,60 @@ std::vector<T> parseArray1D(std::ifstream& f, std::string line){
     }
     return out;
 }
+
 static inline int countChar(const std::string& s, char c){
     int n=0; for(char ch: s) if(ch==c) ++n; return n;
 }
 
+// ---------- Random helpers for soft shadows / DOF / motion blur ----------
+static std::mt19937 g_rng(12345);  // fixed seed for reproducible renders
+
+inline float rand01() {
+    static std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    return dist(g_rng);
+}
+
+// Random point inside unit sphere
+inline Vec3 random_in_unit_sphere() {
+    while (true) {
+        float x = rand01()*2.0f - 1.0f;
+        float y = rand01()*2.0f - 1.0f;
+        float z = rand01()*2.0f - 1.0f;
+        float r2 = x*x + y*y + z*z;
+        if (r2 <= 1.0f) return Vec3(x,y,z);
+    }
+}
+
+inline void random_in_unit_disk(float &x, float &y) {
+    float r = std::sqrt(rand01());
+    float phi = 2.0f * PI * rand01();
+    x = r * std::cos(phi);
+    y = r * std::sin(phi);
+}
+
+// Jitter a perfect reflection direction into a "glossy" lobe
+inline Vec3 jitter_reflection(const Vec3& R, float roughness, const Vec3& normal)
+{
+    // R should be unit length
+    Vec3 dir = R;
+    if (roughness > 0.0f) {
+        // Small random vector in unit sphere, scaled by roughness
+        Vec3 jitter = random_in_unit_sphere() * roughness;
+        dir = normalize(R + jitter);
+        // Make sure the glossy ray is still on the same side of the surface as the ideal reflection
+        if (dot(dir, normal) < 0.0f) {
+            dir = dir * -1.0f;
+        }
+    }
+    return dir;
+}
+
+
 // ---------------- Lighting & Materials ----------------
 struct PointLight {
     Vec3 position;
-    float intensity; // scalar; 1/r^2 falloff applied in shader
+    float intensity;   // scalar; 1/r^2 falloff
+    float radius = 0.0f; // 0 => hard shadow, >0 => soft shadow area light
 };
 
 struct Material {
@@ -114,69 +165,132 @@ inline float fresnel_schlick(float cosTheta, float F0){
 static const int   kMaxDepth   = 4;
 static const float kShadowBias = 1e-3f;
 
-// Shade a hit with Blinn-Phong and hard shadows + texture lookup
+// How many shadow samples per light (area light sampling)
+static const int kShadowSamples = 4;
+
+static const int   kGlossySamples   = 4;    // number of reflection rays
+static const float kMinGlossRough   = 0.02f;
+static const float kMaxGlossRough   = 0.3f;
+
+// -------- Feature toggles & DOF / motion blur params --------
+bool  g_enable_dof           = true;   // depth of field
+bool  g_enable_motion_blur   = true;   // per-ray time sampling
+bool  g_enable_soft_shadows  = true;   // area-light sampling
+bool  g_enable_glossy        = true;   // glossy reflections
+bool  g_enable_aa            = true;  // anti aliasing
+
+float g_lens_radius  = 0.01f;        // radius of lens in world units (tune!)
+float g_focus_dist   = 2.5f;          // distance from camera to focal plane
+
+
+
+// Motion blur shutter interval in normalized time [0,1]
+static const float g_shutter_open  = 0.0f;
+static const float g_shutter_close = 1.0f;
+
+inline float lerp(float a, float b, float t) {
+    return a + t * (b - a);
+}
+
+
+
 Vec3 shadeHit(const Hit& hit, const Vec3& viewDir,
+              float rayTime,
               const std::vector<PointLight>& lights,
               const std::unordered_map<const Shape*, Material>& matOf,
               const std::vector<std::unique_ptr<Shape>>& shapes,
               const BVH* bvh,
               const Texture* tex)
+
 {
     auto it = matOf.find(hit.shape);
-    Material mat = (it!=matOf.end()) ? it->second : Material{};
+    Material mat = (it != matOf.end()) ? it->second : Material{};
 
     Vec3 N = hit.n;
     Vec3 V = viewDir;
     Vec3 color(0,0,0);
 
-    // Base albedo from texture (if available)
-    Vec3 texAlbedo(1,1,1);
-    if (tex) {
-        float u = hit.uvw.x;
-        float v = hit.uvw.y;
-        texAlbedo = tex->sample(u, v);
-    }
+    // Decide once whether we actually use textures
+    bool useTex = (tex != nullptr) && tex->valid() && g_enable_textures;
 
-    for(const auto& Ls : lights){
-        Vec3 Ldir = Ls.position - hit.p;
-        float dist2 = dot(Ldir, Ldir);
-        float dist  = std::sqrt(std::max(dist2, 1e-12f));
-        Ldir = Ldir / dist;
+    for (const auto& Ls : lights) {
+        // Decide if this light should behave as an area light
+        bool soft = (g_enable_soft_shadows && Ls.radius > 0.0f && kShadowSamples > 1);
+        int  samples = soft ? kShadowSamples : 1;
 
-        // Shadow ray toward the light
-        Ray shadowRay;
-        shadowRay.origin = hit.p + N * kShadowBias;
-        shadowRay.dir    = Ldir;
-        shadowRay.tmin   = 0.0f;
-        shadowRay.tmax   = dist - 1e-3f;
+        Vec3 lightAccum(0,0,0);
 
-        bool occluded = false;
-        if (bvh){
-            Hit occ;
-            occluded = bvh->intersect(shadowRay, occ);
-        } else {
-            for(const auto& s: shapes){
-                Hit htmp; if(s->intersect(shadowRay, htmp)){ occluded = true; break; }
+        for (int s = 0; s < samples; ++s) {
+            // Point or area light position
+            Vec3 lightPos = Ls.position;
+            if (soft) {
+                // Only jitter when soft shadows are enabled
+                Vec3 jitter = random_in_unit_sphere() * Ls.radius;
+                lightPos += jitter;
             }
+
+            Vec3 Ldir = lightPos - hit.p;
+            float dist2 = dot(Ldir, Ldir);
+            float dist  = std::sqrt(std::max(dist2, 1e-12f));
+            Ldir = Ldir / dist;
+
+            // Shadow ray
+            Ray shadowRay;
+            shadowRay.origin = hit.p + N * kShadowBias;
+            shadowRay.dir    = Ldir;
+            shadowRay.tmin   = 0.0f;
+            shadowRay.tmax   = dist - 1e-3f;
+            shadowRay.time   = rayTime;
+
+            bool occluded = false;
+            if (bvh) {
+                Hit occ;
+                occluded = bvh->intersect(shadowRay, occ);
+            } else {
+                for (const auto& s : shapes) {
+                    Hit htmp;
+                    if (s->intersect(shadowRay, htmp)) { occluded = true; break; }
+                }
+            }
+            if (occluded) continue;
+
+            // --- Blinn-Phong for this sample ---
+            float NdotL = std::max(0.f, dot(N, Ldir));
+            if (NdotL <= 0.0f) continue;
+
+            // Sample texture / albedo
+            Vec3 albedo(1.0f, 1.0f, 1.0f);
+            if (useTex) {
+                float u = hit.uvw.x;
+                float v = hit.uvw.y;
+                albedo = tex->sample(u, v);   // already in [0,1]
+            }
+
+            // Component-wise multiply kd by albedo
+            Vec3 kd_eff(
+                mat.kd.x * albedo.x,
+                mat.kd.y * albedo.y,
+                mat.kd.z * albedo.z
+            );
+
+            Vec3 diffuse = kd_eff * NdotL;
+
+            Vec3 H = normalize(Ldir + V);
+            float NdotH = std::max(0.f, dot(N, H));
+            Vec3 spec = mat.ks * std::pow(NdotH, mat.shininess);
+
+            float atten = Ls.intensity / std::max(1.f, dist2);
+            lightAccum += (diffuse + spec) * atten;
         }
-        if (occluded) continue;
 
-        // Blinn-Phong terms
-        float NdotL = std::max(0.f, dot(N, Ldir));
-
-        // Combine kd with texture albedo
-        Vec3 diffuse = (mat.kd * texAlbedo) * NdotL; // component-wise * then scalar
-
-        Vec3 H = normalize(Ldir + V);
-        float NdotH = std::max(0.f, dot(N, H));
-        Vec3 spec = mat.ks * std::pow(NdotH, mat.shininess);
-
-        float atten = Ls.intensity / std::max(1.f, dist2);
-        color += (diffuse + spec) * atten;
+        if (samples > 0) {
+            color += lightAccum * (1.0f / float(samples));
+        }
     }
 
     return clamp01(color);
 }
+
 
 // Radiance along a ray with recursion for reflections/refractions
 Vec3 traceRay(const Ray& r,
@@ -193,7 +307,11 @@ Vec3 traceRay(const Ray& r,
     if (bvh) ok = bvh->intersect(r, hit);
     else {
         for(const auto& s: shapes){
-            Hit h; if (s->intersect(r,h) && h.t < hit.t) { hit = h; ok = true; }
+            Hit h; 
+            if (s->intersect(r,h) && h.t < hit.t) { 
+                hit = h; 
+                ok  = true; 
+            }
         }
     }
     if (!ok) return Vec3(0.2f,0.3f,0.5f); // background
@@ -201,19 +319,48 @@ Vec3 traceRay(const Ray& r,
     const Material& mat = (matOf.count(hit.shape)? matOf.at(hit.shape) : Material{});
     Vec3 V = normalize((r.dir) * -1.0f);
 
-    // Direct lighting (with texture)
-    Vec3 Lo = shadeHit(hit, V, lights, matOf, shapes, bvh, tex);
+    // Direct lighting (with optional texture)
+    Vec3 Lo = shadeHit(hit, V, r.time, lights, matOf, shapes, bvh, tex);
+
 
     // Secondary rays
     Vec3 N = hit.n;
     Vec3 accum = Lo;
 
-    // Reflection
+    // Reflection (glossy via distributed ray tracing, toggleable)
     if (mat.reflectivity > 0.0f){
-        Vec3 Rdir = reflect(r.dir, N);
-        Ray rRef{ hit.p + N * kShadowBias, normalize(Rdir) };
-        Vec3 Lr = traceRay(rRef, shapes, bvh, matOf, lights, tex, depth+1);
-        accum += Lr * mat.reflectivity;
+        Vec3 Rideal = normalize(reflect(r.dir, N));
+
+        Vec3 reflAccum(0,0,0);
+
+        if (g_enable_glossy) {
+            // Glossy: multiple jittered rays in a lobe
+            float glossRough = 0.5f / std::sqrt(std::max(1.0f, mat.shininess));
+            glossRough = std::max(kMinGlossRough, std::min(kMaxGlossRough, glossRough));
+
+            int  nSamples = kGlossySamples;
+            for (int i = 0; i < nSamples; ++i) {
+                Vec3 Rdir = jitter_reflection(Rideal, glossRough, N);
+
+                Ray rRef;
+                rRef.origin = hit.p + N * kShadowBias;
+                rRef.dir    = Rdir;
+                rRef.time   = r.time;    // propagate shutter time to reflection ray
+
+                reflAccum += traceRay(rRef, shapes, bvh, matOf, lights, tex, depth+1);
+            }
+            reflAccum = reflAccum * (1.0f / float(nSamples));
+        } else {
+            // Plain mirror: single perfect reflection
+            Ray rRef;
+            rRef.origin = hit.p + N * kShadowBias;
+            rRef.dir    = Rideal;
+            rRef.time   = r.time;
+
+            reflAccum = traceRay(rRef, shapes, bvh, matOf, lights, tex, depth+1);
+        }
+
+        accum += reflAccum * mat.reflectivity;
     }
 
     // Refraction (glass)
@@ -233,7 +380,11 @@ Vec3 traceRay(const Ray& r,
             float R0 = std::pow((n1 - n2)/(n1 + n2), 2.0f);
             float Fr = fresnel_schlick(std::fabs(cosi), R0);
 
-            Ray rRefr{ hit.p - N * kShadowBias, normalize(Tdir) };
+            Ray rRefr;
+            rRefr.origin = hit.p - N * kShadowBias;
+            rRefr.dir    = normalize(Tdir);
+            rRefr.time   = r.time;   // propagate shutter time to refraction ray
+
             Vec3 Lt = traceRay(rRefr, shapes, bvh, matOf, lights, tex, depth+1);
 
             // Mix local + transmission (reflection already added above)
@@ -246,11 +397,51 @@ Vec3 traceRay(const Ray& r,
     return clamp01(accum);
 }
 
-int main(){
+
+int main(int argc, char** argv){
+    // --- Parse command-line flags ---
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+
+        if (arg == "--textures" || arg == "-t") {
+            g_enable_textures = true;
+        }
+        else if (arg == "--no-textures" || arg == "-nt") {
+            g_enable_textures = false;
+        }
+        else if (arg == "--no-dof") {
+            g_enable_dof = false;
+        }
+        else if (arg == "--no-motion-blur") {
+            g_enable_motion_blur = false;
+        }
+        else if (arg == "--no-soft-shadows") {
+            g_enable_soft_shadows = false;
+        }
+        else if (arg == "--no-glossy") {
+            g_enable_glossy = false;
+        }
+        else if (arg == "--no-aa") {
+            g_enable_aa = false;
+        }
+        else {
+            std::cout << "Unknown argument: " << arg << "\n";
+        }
+    }
+
+    std::cout << "Textures:       " << (g_enable_textures      ? "ON" : "OFF") << "\n";
+    std::cout << "DOF:            " << (g_enable_dof           ? "ON" : "OFF") << "\n";
+    std::cout << "Motion blur:    " << (g_enable_motion_blur   ? "ON" : "OFF") << "\n";
+    std::cout << "Soft shadows:   " << (g_enable_soft_shadows  ? "ON" : "OFF") << "\n";
+    std::cout << "Glossy refl:    " << (g_enable_glossy        ? "ON" : "OFF") << "\n";
+
     // ---------- Load camera ----------
     Camera cam;
     cam.read_from_file("../Blend/export.json");
     cam.print_info();
+
+    Vec3 camEye, camRight, camUp, camForward;
+    cam.get_eye_and_basis(camEye, camRight, camUp, camForward);
 
     // ---------- Load shapes + materials from JSON ----------
     std::vector<std::unique_ptr<Shape>> shapes;
@@ -324,38 +515,72 @@ int main(){
                 float r = 1.0f;
                 bool haveRadius = false;
                 Material M;
+
+                // NEW: velocity per sphere from JSON
+                Vec3 vel(0,0,0);
+                bool haveVel = false;
+
                 int depth=1;
                 while(std::getline(file,line)){
                     line=trim(line);
                     depth += countChar(line,'{');
                     depth -= countChar(line,'}');
+
                     if(line.find("\"location\"")!=std::string::npos){
-                        auto v=parseArray1D<double>(file,line); if(v.size()==3) C=Vec3(v[0],v[1],v[2]);
-                    } else if(line.find("\"scale\"")!=std::string::npos){
-                        auto v=parseArray1D<double>(file,line); if(v.size()==3){ S=Vec3(v[0],v[1],v[2]); haveScale=true; }
-                    } else if(line.find("\"radius\"")!=std::string::npos){
+                        auto v=parseArray1D<double>(file,line); 
+                        if(v.size()==3) C=Vec3(v[0],v[1],v[2]);
+                    } 
+                    else if(line.find("\"scale\"")!=std::string::npos){
+                        auto v=parseArray1D<double>(file,line); 
+                        if(v.size()==3){ S=Vec3(v[0],v[1],v[2]); haveScale=true; }
+                    } 
+                    else if(line.find("\"radius\"")!=std::string::npos){
                         size_t cpos=line.find(':'); 
                         if(cpos!=std::string::npos){
-                            std::string v=trim(line.substr(cpos+1)); if(!v.empty()&&v.back()==',') v.pop_back();
+                            std::string v=trim(line.substr(cpos+1)); 
+                            if(!v.empty()&&v.back()==',') v.pop_back();
                             try{ r=(float)std::stod(v); haveRadius=true; }catch(...){}
                         }
-                    } else if(line.find("\"material\"")!=std::string::npos || line.find("\"kd\"")!=std::string::npos ||
-                              line.find("\"ks\"")!=std::string::npos || line.find("\"shininess\"")!=std::string::npos ||
-                              line.find("\"reflectivity\"")!=std::string::npos || line.find("\"transmissive\"")!=std::string::npos ||
-                              line.find("\"ior\"")!=std::string::npos){
+                    }
+                    // NEW: parse optional "velocity": [vx, vy, vz]
+                    else if(line.find("\"velocity\"") != std::string::npos){
+                        auto v = parseArray1D<double>(file, line);
+                        if (v.size() == 3) {
+                            vel = Vec3((float)v[0], (float)v[1], (float)v[2]);
+                            haveVel = true;
+                        }
+                    }
+                    else if(line.find("\"material\"")!=std::string::npos || line.find("\"kd\"")!=std::string::npos ||
+                            line.find("\"ks\"")!=std::string::npos || line.find("\"shininess\"")!=std::string::npos ||
+                            line.find("\"reflectivity\"")!=std::string::npos || line.find("\"transmissive\"")!=std::string::npos ||
+                            line.find("\"ior\"")!=std::string::npos){
                         maybeParseMaterial(file, line, M);
                     }
+
                     if(depth==0) break;
                 }
 
+                Sphere* sphPtr = nullptr;
                 if (haveScale) {
-                    shapes.emplace_back(std::make_unique<Sphere>(C, S)); // Ellipsoid
+                    auto sph = std::make_unique<Sphere>(C, S);      // Ellipsoid
+                    sphPtr = sph.get();
+                    shapes.emplace_back(std::move(sph));
                 } else {
-                    if(!haveRadius && haveScale) r = std::max(S.x,std::max(S.y,S.z));
-                    shapes.emplace_back(std::make_unique<Sphere>(C, r)); // Uniform
+                    if(!haveRadius && haveScale) 
+                        r = std::max(S.x,std::max(S.y,S.z));
+                    auto sph = std::make_unique<Sphere>(C, r);      // Uniform
+                    sphPtr = sph.get();
+                    shapes.emplace_back(std::move(sph));
                 }
+
+                // Apply parsed velocity if present
+                if (sphPtr && haveVel) {
+                    sphPtr->velocity = vel;
+                }
+
                 matOf[shapes.back().get()] = M;
             }
+
         }
         if(line.find("]")!=std::string::npos) section=NONE;
     }
@@ -371,32 +596,56 @@ int main(){
             std::string L; enum {LNONE, LPOINTS} lsec = LNONE;
             while(std::getline(lf,L)){
                 L = trim(L);
-                if(L.find("\"point_lights\"") != std::string::npos){ lsec = LPOINTS; continue; }
+                if(L.find("\"point_lights\"") != std::string::npos){ 
+                    lsec = LPOINTS; 
+                    continue; 
+                }
                 if(L.find("{")!=std::string::npos && lsec==LPOINTS){
-                    Vec3 pos(0,0,0); float I=100.0f;
-                    int depth=1;
+                    Vec3 pos(0,0,0); 
+                    float I   = 100.0f;
+                    float rad = 0.0f;   // start fresh per-light
+                    int depth = 1;
+
                     while(std::getline(lf,L)){
                         L = trim(L);
                         depth += countChar(L,'{');
                         depth -= countChar(L,'}');
+
                         if(L.find("\"location\"")!=std::string::npos){
                             auto v = parseArray1D<double>(lf, L);
                             if(v.size()==3) pos = Vec3(v[0],v[1],v[2]);
-                        } else if(L.find("\"radiant_intensity\"")!=std::string::npos){
-                            size_t c=L.find(':'); if(c!=std::string::npos){
-                                std::string s=trim(L.substr(c+1)); if(!s.empty()&&s.back()==',') s.pop_back();
+                        } 
+                        else if(L.find("\"radiant_intensity\"")!=std::string::npos){
+                            size_t c=L.find(':'); 
+                            if(c!=std::string::npos){
+                                std::string s=trim(L.substr(c+1)); 
+                                if(!s.empty()&&s.back()==',') s.pop_back();
                                 try{ I=(float)std::stod(s);}catch(...){}
                             }
+                        } 
+                        else if(L.find("\"radius\"")!=std::string::npos){
+                            size_t c=L.find(':'); 
+                            if(c!=std::string::npos){
+                                std::string s=trim(L.substr(c+1));
+                                if(!s.empty()&&s.back()==',') s.pop_back();
+                                try{ rad=(float)std::stod(s);}catch(...){}
+                            }
                         }
+
                         if(depth==0) break;
                     }
-                    lights.push_back({pos,I});
+
+                    lights.push_back({pos, I, rad});
                 }
                 if(L.find("]")!=std::string::npos) lsec = LNONE;
             }
         }
     }
     std::cout << "Loaded " << lights.size() << " point lights.\n";
+    for (const auto& L : lights) {
+        std::cout << "  Light at (" << L.position.x << "," << L.position.y << "," << L.position.z
+                  << ") I=" << L.intensity << " radius=" << L.radius << "\n";
+    }
 
     // ---------- Load a single texture (no filenames from Blender) ----------
     Texture tex;
@@ -416,55 +665,178 @@ int main(){
     double build_ms = std::chrono::duration<double, std::milli>(tBuild1 - tBuild0).count();
     std::cout << "BVH build: " << build_ms << " ms\n";
 
+
+    // ---------------- Auto-focus: cast a ray through the center pixel ----------------
+    float focus_dist = 3.0f;   // fallback value
+
+    {
+        float cx = cam.film_width()  * 0.5f;
+        float cy = cam.film_height() * 0.5f;
+
+        float ox, oy, oz, dx, dy, dz;
+        cam.pixel_to_ray(cx, cy, ox, oy, oz, dx, dy, dz);
+
+        Ray centerRay{ Vec3(ox,oy,oz), normalize(Vec3(dx,dy,dz)) };
+        centerRay.time = 0.5f * (g_shutter_open + g_shutter_close);
+
+        Hit h;
+        bool ok = bvh.intersect(centerRay, h);
+        if (ok) {
+            focus_dist = h.t;     // <-- auto-focus!
+            std::cout << "Auto-focus distance = " << focus_dist << "\n";
+        } else {
+            std::cout << "Auto-focus failed (no hit), using fallback\n";
+        }
+    }
+
+
     // ---------- Render (Whitted + AA) ----------
     int W = cam.film_width() > 0 ? cam.film_width() : 640;
     int H = cam.film_height() > 0 ? cam.film_height() : 480;
     std::vector<Vec3> fb(W*H);
 
-    const int spp = 4; // 2x2 stratified supersampling
-    const float invSpp = 1.0f / float(spp);
-
     auto render_and_time = [&](bool useBVH, int& hitCountOut) -> double {
         hitCountOut = 0;
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        for(int y=0;y<H;++y){
-            for(int x=0;x<W;++x){
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+
                 Vec3 accum(0,0,0);
 
-                // 2x2 sample grid inside the pixel
-                for(int sy=0; sy<2; ++sy){
-                    for(int sx=0; sx<2; ++sx){
-                        float jx = (sx + 0.5f) / 2.0f;
-                        float jy = (sy + 0.5f) / 2.0f;
-                        float px = x + jx;
-                        float py = y + jy;
+                if (!g_enable_aa) {
+                    // ----------------- NO AA: 1 sample per pixel -----------------
+                    float px = x + 0.5f;
+                    float py = y + 0.5f;
 
-                        float ox,oy,oz,dx,dy,dz;
-                        cam.pixel_to_ray(px,py,ox,oy,oz,dx,dy,dz);
-                        Ray ray{Vec3(ox,oy,oz), normalize(Vec3(dx,dy,dz))};
+                    float ox,oy,oz,dx,dy,dz;
+                    cam.pixel_to_ray(px,py,ox,oy,oz,dx,dy,dz);
+                    Vec3 origin(ox,oy,oz);
+                    Vec3 dir    = normalize(Vec3(dx,dy,dz));
 
-                        // For hit statistics, only test once per sample
-                        Hit hcount;
-                        bool anyHit = useBVH ? bvh.intersect(ray, hcount)
-                                             : ([&]{
-                                                    for(const auto& s:shapes){
-                                                        Hit h; if(s->intersect(ray,h) && h.t < hcount.t){ hcount=h; return true; }
-                                                    }
-                                                    return false;
-                                                })();
-                        if (anyHit) hitCountOut++;
-
-                        // Whitted color with texture
-                        Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights,
-                                                     tex.valid() ? &tex : nullptr, 0)
-                                          : traceRay(ray, shapes, nullptr, matOf, lights,
-                                                     tex.valid() ? &tex : nullptr, 0);
-                        accum += col;
+                    float rayTime;
+                    if (g_enable_motion_blur) {
+                        float shutterStart = g_shutter_open;
+                        float shutterEnd   = g_shutter_close;
+                        rayTime = shutterStart + rand01() * (shutterEnd - shutterStart);
+                    } else {
+                        rayTime = 0.5f * (g_shutter_open + g_shutter_close);
                     }
+
+                    if (g_enable_dof && g_lens_radius > 0.0f) {
+                        Vec3 focusPoint = origin + dir * g_focus_dist;
+
+                        float lx, ly;
+                        random_in_unit_disk(lx, ly);
+                        lx *= g_lens_radius;
+                        ly *= g_lens_radius;
+
+                        Vec3 lensOffset = camRight * lx + camUp * ly;
+                        Vec3 newOrigin  = origin + lensOffset;
+                        Vec3 newDir     = normalize(focusPoint - newOrigin);
+
+                        origin = newOrigin;
+                        dir    = newDir;
+                    }
+
+                    Ray ray;
+                    ray.origin = origin;
+                    ray.dir    = dir;
+                    ray.time   = rayTime;
+
+                    Hit hcount;
+                    bool anyHit = useBVH ? bvh.intersect(ray, hcount)
+                                        : ([&]{
+                                                for (const auto& s : shapes) {
+                                                    Hit h; 
+                                                    if (s->intersect(ray, h) && h.t < hcount.t) { 
+                                                        hcount = h; 
+                                                        return true; 
+                                                    }
+                                                }
+                                                return false;
+                                            })();
+                    if (anyHit) hitCountOut++;
+
+                    Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights,
+                                                tex.valid() ? &tex : nullptr, 0)
+                                    : traceRay(ray, shapes, nullptr, matOf, lights,
+                                                tex.valid() ? &tex : nullptr, 0);
+                    accum = col;
+                } else {
+                    // ----------------- AA ON: grid×grid samples per pixel -----------------
+                    const int grid = 4;                 // <--- 4x4 = 16 samples
+                    const int spp  = grid * grid;
+                    const float invSpp = 1.0f / float(spp);
+
+                    for (int sy = 0; sy < grid; ++sy) {
+                        for (int sx = 0; sx < grid; ++sx) {
+                            float jx = (sx + 0.5f) / float(grid);
+                            float jy = (sy + 0.5f) / float(grid);
+                            float px = x + jx;
+                            float py = y + jy;
+
+                            float ox,oy,oz,dx,dy,dz;
+                            cam.pixel_to_ray(px,py,ox,oy,oz,dx,dy,dz);
+                            Vec3 origin(ox,oy,oz);
+                            Vec3 dir    = normalize(Vec3(dx,dy,dz));
+
+                            float rayTime;
+                            if (g_enable_motion_blur) {
+                                float shutterStart = g_shutter_open;
+                                float shutterEnd   = g_shutter_close;
+                                rayTime = shutterStart + rand01() * (shutterEnd - shutterStart);
+                            } else {
+                                rayTime = 0.5f * (g_shutter_open + g_shutter_close);
+                            }
+
+                            if (g_enable_dof && g_lens_radius > 0.0f) {
+                                Vec3 focusPoint = origin + dir * g_focus_dist;
+
+                                float lx, ly;
+                                random_in_unit_disk(lx, ly);
+                                lx *= g_lens_radius;
+                                ly *= g_lens_radius;
+
+                                Vec3 lensOffset = camRight * lx + camUp * ly;
+                                Vec3 newOrigin  = origin + lensOffset;
+                                Vec3 newDir     = normalize(focusPoint - newOrigin);
+
+                                origin = newOrigin;
+                                dir    = newDir;
+                            }
+
+                            Ray ray;
+                            ray.origin = origin;
+                            ray.dir    = dir;
+                            ray.time   = rayTime;
+
+                            Hit hcount;
+                            bool anyHit = useBVH ? bvh.intersect(ray, hcount)
+                                                : ([&]{
+                                                        for (const auto& s : shapes) {
+                                                            Hit h; 
+                                                            if (s->intersect(ray,h) && h.t < hcount.t){ 
+                                                                hcount = h; 
+                                                                return true; 
+                                                            }
+                                                        }
+                                                        return false;
+                                                    })();
+                            if (anyHit) hitCountOut++;
+
+                            Vec3 col = useBVH ? traceRay(ray, shapes, &bvh, matOf, lights,
+                                                        tex.valid() ? &tex : nullptr, 0)
+                                            : traceRay(ray, shapes, nullptr, matOf, lights,
+                                                        tex.valid() ? &tex : nullptr, 0);
+                            accum += col;
+                        }
+                    }
+
+                    accum = accum * invSpp;
                 }
 
-                fb[y*W + x] = accum * invSpp;
+                fb[y*W + x] = accum;
             }
         }
 
@@ -472,20 +844,11 @@ int main(){
         return std::chrono::duration<double,std::milli>(t1 - t0).count();
     };
 
-    // // Warm-up (optional)
-    // int tmpHits = 0; render_and_time(true, tmpHits);
 
-    // // Measure brute-force
-    // int hits_bruteforce = 0;
-    // double ms_bruteforce = render_and_time(false, hits_bruteforce);
 
-    // Measure BVH
     int hits_bvh = 0;
     double ms_bvh = render_and_time(true, hits_bvh);
-
-    //std::cout << "Brute force: " << ms_bruteforce << " ms, hits=" << hits_bruteforce << "\n";
     std::cout << "BVH:         " << ms_bvh        << " ms, hits=" << hits_bvh << "\n";
-    //if (ms_bvh > 0.0) std::cout << "Speedup:     " << (ms_bruteforce / ms_bvh) << "x\n";
 
     // ---------- Write output ----------
     std::ofstream out("../Output/output.ppm");
