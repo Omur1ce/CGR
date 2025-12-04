@@ -51,6 +51,9 @@ run_no_aa: run
 run_clean: ARGS=--no-textures --no-dof --no-soft-shadows --no-glossy --no-motion-blur --no-aa
 run_clean: run
 
+run_no_lens: ARGS=--no-dof --no-motion-blur
+run_no_lens: run
+
 # ---------- Clean ----------
 clean:
 	rm -f $(EXE)

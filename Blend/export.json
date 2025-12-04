@@ -1,47 +1,117 @@
-
 {
     "cameras": [
         {
             "name": "Camera",
-            "location": [0.0, -3.0, 1.2],
-            "gaze_vector": [0.0, 1.0, -0.3],
-            "up_vector": [0.0, 0.0, 1.0],
+            "location": [
+                7.358891487121582,
+                -6.925790786743164,
+                4.958309173583984
+            ],
+            "gaze_vector": [
+                -0.6515582203865051,
+                0.6141703724861145,
+                -0.44527140259742737
+            ],
+            "up_vector": [
+                -0.32401347160339355,
+                0.305420845746994,
+                0.8953956365585327
+            ],
             "focal_length": 50.0,
             "sensor_width": 36.0,
             "sensor_height": 24.0,
-            "film_resolution": [640, 480],
-            "pixel_aspect": [1.0, 1.0],
+            "film_resolution": [
+                1920,
+                1080
+            ],
+            "pixel_aspect": [
+                1.0,
+                1.0
+            ],
             "resolution_percentage": 100
         }
     ],
-
     "point_lights": [
         {
             "name": "Light",
-            "location": [0.0, -1.0, 2.5],
-            "radiant_intensity": 5.0,
-            "radius": 0.0
+            "location": [
+                4.0947442054748535,
+                -0.292275071144104,
+                3.1073176860809326
+            ],
+            "radiant_intensity": 25.0
         }
     ],
-
-    "spheres": [
+    "spheres": [],
+    "cubes": [
         {
-            "name": "MovingSphere",
-            "location": [0.0, 0.0, 0.5],
-            "radius": 0.3,
-            "velocity": [0.0, -0.2, 0.0],
+            "name": "Cube",
+            "translation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": [
+                1.0,
+                1.0,
+                1.0
+            ],
             "material": {
-                "kd": [0.8, 0.2, 0.2],
-                "ks": [0.9, 0.9, 0.9],
-                "shininess": 128.0,
-                "reflectivity": 0.2,
+                "kd": [
+                    0.8,
+                    0.8,
+                    0.8
+                ],
+                "ks": [
+                    0.2,
+                    0.2,
+                    0.2
+                ],
+                "shininess": 32.0,
+                "reflectivity": 0.0,
                 "transmissive": 0.0,
                 "ior": 1.5
             }
+        },
+        {
+            "name": "Cube.001",
+            "translation": [
+                -0.511576771736145,
+                1.0284868478775024,
+                0.06842614710330963
+            ],
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "scale": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "material": {
+                "kd": [
+                    0.4988536834716797,
+                    0.15560171008110046,
+                    0.8000156879425049
+                ],
+                "ks": [
+                    0.2,
+                    0.2,
+                    0.2
+                ],
+                "shininess": 6.0,
+                "reflectivity": 0.1,
+                "transmissive": 0.0,
+                "ior": 1.4500000476837158
+            }
         }
     ],
-
-    "planes": [],
-
-    "cubes": []
+    "planes": []
 }

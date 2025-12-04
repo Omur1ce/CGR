@@ -166,9 +166,9 @@ static const int   kMaxDepth   = 4;
 static const float kShadowBias = 1e-3f;
 
 // How many shadow samples per light (area light sampling)
-static const int kShadowSamples = 4;
+static const int kShadowSamples = 12;
 
-static const int   kGlossySamples   = 4;    // number of reflection rays
+static const int   kGlossySamples   = 2;    // number of reflection rays
 static const float kMinGlossRough   = 0.02f;
 static const float kMaxGlossRough   = 0.3f;
 
@@ -649,8 +649,8 @@ int main(int argc, char** argv){
 
     // ---------- Load a single texture (no filenames from Blender) ----------
     Texture tex;
-    if (!tex.loadPPM("../Textures/tex2.ppm")) {
-        std::cerr << "Warning: could not load ../Textures/tex2.ppm, using flat colors only.\n";
+    if (!tex.loadPPM("../Textures/tex.ppm")) {
+        std::cerr << "Warning: could not load ../Textures/tex1.ppm, using flat colors only.\n";
     }
 
     // ---------- BVH ----------
@@ -765,7 +765,7 @@ int main(int argc, char** argv){
                     accum = col;
                 } else {
                     // ----------------- AA ON: grid×grid samples per pixel -----------------
-                    const int grid = 4;                 // <--- 4x4 = 16 samples
+                    const int grid = 2;                 // <--- 4x4 = 16 samples
                     const int spp  = grid * grid;
                     const float invSpp = 1.0f / float(spp);
 
