@@ -1,0 +1,26 @@
+Module 1
+Blender exporter
+Camera Space
+Image R/W
+
+Module 2
+Ray intersection
+Acceleration
+
+Module 3
+Whitted-style
+Antialiasing
+Textures
+
+Final raytracer
+Sys. Integration
+Distributed RT (both soft shadows and glossy reflections
+Lens effect (both motion blur and DOF)
+
+Timeliness Bonus
+Module 1
+Module 2
+Module 3
+
+Report
+Exceptionalism

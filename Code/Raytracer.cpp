@@ -166,7 +166,7 @@ static const int   kMaxDepth   = 4;
 static const float kShadowBias = 1e-3f;
 
 // How many shadow samples per light (area light sampling)
-static const int kShadowSamples = 12;
+static const int kShadowSamples = 8;
 
 static const int   kGlossySamples   = 2;    // number of reflection rays
 static const float kMinGlossRough   = 0.02f;
@@ -437,7 +437,7 @@ int main(int argc, char** argv){
 
     // ---------- Load camera ----------
     Camera cam;
-    cam.read_from_file("../Blend/export.json");
+    cam.read_from_file("../ASCII/current.json");
     cam.print_info();
 
     Vec3 camEye, camRight, camUp, camForward;
@@ -447,7 +447,7 @@ int main(int argc, char** argv){
     std::vector<std::unique_ptr<Shape>> shapes;
     std::unordered_map<const Shape*, Material> matOf;
 
-    std::ifstream file("../Blend/export.json");
+    std::ifstream file("../ASCII/current.json");
     if(!file.is_open()){ std::cerr<<"cannot open scene\n"; return 1; }
 
     std::string line;
@@ -591,7 +591,7 @@ int main(int argc, char** argv){
     // ---------- Load point lights ----------
     std::vector<PointLight> lights;
     {
-        std::ifstream lf("../Blend/export.json");
+        std::ifstream lf("../ASCII/current.json");
         if(lf.is_open()){
             std::string L; enum {LNONE, LPOINTS} lsec = LNONE;
             while(std::getline(lf,L)){
